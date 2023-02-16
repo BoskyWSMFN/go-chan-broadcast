@@ -11,7 +11,7 @@ on:
 
 jobs:
 
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -22,4 +22,4 @@ jobs:
         go-version: 1.19
 
     - name: Test
-      run: go test -v ./...
+      run: go test -timeout 30s -v -race github.com/BoskyWSMFN/go-chan-broadcast/pkg/broadcast
