@@ -115,9 +115,7 @@ func (b *subscribersManagement[T]) compareAndSwapCurrentAndCopiedSliceStorages(
 ) (
 	swapped bool,
 ) {
-	if swapped = b.channels.CompareAndSwap(currentStorage, copiedStorage); swapped {
-		b.putSliceStorageToPool(currentStorage) // old (current) will be reused later
-	} else {
+	if swapped = b.channels.CompareAndSwap(currentStorage, copiedStorage); !swapped {
 		b.putSliceStorageToPool(copiedStorage) // new (copied) storage must be put back to pool if not success
 	}
 
@@ -149,15 +147,9 @@ func (b *subscribersManagement[T]) removeChannel(ch chan T) {
 }
 
 func (b *subscribersManagement[T]) write(ctx context.Context, data T, block bool) {
-	_, s := b.getCurrentAndCopiedSliceStorages()
-	defer b.putSliceStorageToPool(s)
-
 	writeFunc := getWriteFunc[T](ctx, block)
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for _, channel := range s.slice {
+	for _, channel := range b.channels.Load().slice {
 		writeFunc(channel, data)
 	}
 }
