@@ -13,6 +13,9 @@ type (
 		// Broadcaster's active channel slice.
 		Subscribe() Subscriber[T]
 
+		// DetachAndWrite is a shorthand for "go WriteCtx()". Possible resource leak if
+		// context.Background() or any other non-cancellable context is used. Short
+		DetachAndWrite(ctx context.Context, data T)
 		// WriteNonBlock uses select-default statement inside so the written data can be missed by some routines.
 		// To prevent it use WriteCtx.
 		WriteNonBlock(T)
@@ -29,6 +32,7 @@ type (
 	}
 )
 
+// New creates go channel like Broadcaster. Buffer length may be passed as an argument. Args[1:] will be ignored.
 func New[T any](
 	buffer ...int,
 ) Broadcaster[T] {
@@ -65,6 +69,12 @@ func (b *subscribersManagement[T]) Subscribe() Subscriber[T] {
 	b.appendChannel(s.activeChan)
 
 	return s
+}
+
+// DetachAndWrite is a shorthand for "go WriteCtx()". Possible resource leak if
+// context.Background() or any other non-cancellable context is used.
+func (b *subscribersManagement[T]) DetachAndWrite(ctx context.Context, data T) {
+	go b.WriteCtx(ctx, data)
 }
 
 // WriteNonBlock uses select-default statement inside so the written data can be missed by some routines.
@@ -123,25 +133,29 @@ func (b *subscribersManagement[T]) compareAndSwapCurrentAndCopiedSliceStorages(
 }
 
 func (b *subscribersManagement[T]) appendChannel(ch chan T) {
-	oldStorage, newStorage := b.getCurrentAndCopiedSliceStorages()
+	currentStorage, copiedStorage := b.getCurrentAndCopiedSliceStorages()
 
-	if !newStorage.appendValue(ch) {
-		b.putSliceStorageToPool(newStorage)
+	if !copiedStorage.appendValue(ch) { // not appending if already contains
+		b.putSliceStorageToPool(copiedStorage)
+
+		return
 	}
 
-	if !b.compareAndSwapCurrentAndCopiedSliceStorages(oldStorage, newStorage) {
+	if !b.compareAndSwapCurrentAndCopiedSliceStorages(currentStorage, copiedStorage) {
 		b.appendChannel(ch) // pointer has already been swapped, need one more try to prevent active channels lose
 	}
 }
 
 func (b *subscribersManagement[T]) removeChannel(ch chan T) {
-	oldStorage, newStorage := b.getCurrentAndCopiedSliceStorages()
+	currentStorage, copiedStorage := b.getCurrentAndCopiedSliceStorages()
 
-	if !newStorage.removeValue(ch) {
-		b.putSliceStorageToPool(newStorage)
+	if !copiedStorage.removeValue(ch) { // not removing if doesn't contain
+		b.putSliceStorageToPool(copiedStorage)
+
+		return
 	}
 
-	if !b.compareAndSwapCurrentAndCopiedSliceStorages(oldStorage, newStorage) {
+	if !b.compareAndSwapCurrentAndCopiedSliceStorages(currentStorage, copiedStorage) {
 		b.removeChannel(ch) // pointer has already been swapped, need one more try to prevent active channels lose
 	}
 }
