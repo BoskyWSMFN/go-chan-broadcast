@@ -3,7 +3,7 @@ package broadcast
 type (
 	// slice storage - storage for slice of active objects
 	sliceStorage[T any] struct {
-		slice []chan T
+		slice []chan T // TODO linked list?
 	}
 )
 
@@ -22,18 +22,10 @@ func (s *sliceStorage[T]) copySliceTo(newStorage *sliceStorage[T]) {
 }
 
 func (s *sliceStorage[T]) appendValue(v chan T) (appended bool) {
-	var valFound bool
-
 	for _, sliceV := range s.slice {
 		if v == sliceV {
-			valFound = true
-
-			break
+			return false
 		}
-	}
-
-	if valFound {
-		return false
 	}
 
 	s.slice = append(s.slice, v)

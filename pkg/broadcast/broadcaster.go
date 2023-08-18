@@ -33,9 +33,7 @@ type (
 )
 
 // New creates go channel like Broadcaster. Buffer length may be passed as an argument. Args[1:] will be ignored.
-func New[T any](
-	buffer ...int,
-) Broadcaster[T] {
+func New[T any](buffer ...int) Broadcaster[T] {
 	var buf int
 	if len(buffer) > 0 {
 		buf = buffer[0]
@@ -52,7 +50,8 @@ func New[T any](
 		return newSubscriber[T](
 			subscribersPool,
 			c.removeChannel,
-			buf)
+			buf,
+		)
 	}
 	c.subscribersPool = subscribersPool
 
