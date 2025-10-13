@@ -29,7 +29,7 @@ func Test_BroadcastNonBlockNotBuffered(t *testing.T) {
 
 	wg.Add(routinesAmount) // routines init
 
-	for i := 0; i < routinesAmount; i++ {
+	for i := range routinesAmount {
 		go func(s Subscriber[int], routineNumber int) {
 			defer s.Dispatch()
 
@@ -88,7 +88,7 @@ func Test_BroadcastBlockNotBuffered(t *testing.T) {
 
 	wg.Add(routinesAmount) // routines init
 
-	for i := 0; i < routinesAmount; i++ {
+	for i := range routinesAmount {
 		go func(s Subscriber[int], routineNumber int) {
 			defer s.Dispatch()
 
@@ -147,7 +147,7 @@ func Test_BroadcastCtxNotBuffered(t *testing.T) {
 
 	wg.Add(routinesAmount) // routines init
 
-	for i := 0; i < routinesAmount; i++ {
+	for i := range routinesAmount {
 		go func(s Subscriber[int], routineNumber int) {
 			defer s.Dispatch()
 
@@ -209,7 +209,7 @@ func Test_BroadcastNonBlockBuffered(t *testing.T) {
 
 	wg.Add(routinesAmount) // routines init
 
-	for i := 0; i < routinesAmount; i++ {
+	for i := range routinesAmount {
 		go func(s Subscriber[int], routineNumber int) {
 			defer s.Dispatch()
 
@@ -268,7 +268,7 @@ func Test_BroadcastBlockBuffered(t *testing.T) {
 
 	wg.Add(routinesAmount) // routines init
 
-	for i := 0; i < routinesAmount; i++ {
+	for i := range routinesAmount {
 		go func(s Subscriber[int], routineNumber int) {
 			defer s.Dispatch()
 
@@ -327,7 +327,7 @@ func Test_BroadcastCtxBuffered(t *testing.T) {
 
 	wg.Add(routinesAmount) // routines init
 
-	for i := 0; i < routinesAmount; i++ {
+	for i := range routinesAmount {
 		go func(s Subscriber[int], routineNumber int) {
 			defer s.Dispatch()
 

@@ -12,11 +12,11 @@ func newSliceStorage[T any]() *sliceStorage[T] {
 }
 
 func (s *sliceStorage[T]) copySliceTo(newStorage *sliceStorage[T]) {
-	// In Go slice is basically a struct with uintptr as its last element. append() just copies this uintptr if cap
-	// is unchanged. This behavior might be tricky so make sure slices won't share the same uintptr.
-	if cap(newStorage.slice) < len(s.slice) { // new slice won't fit into old one, realloc and copy
+	// Ensure slices do not share the same backing array.
+	// If capacity of destination is insufficient, reallocate.
+	if cap(newStorage.slice) < len(s.slice) {
 		newStorage.slice = append(make([]chan T, 0, len(s.slice)), s.slice...)
-	} else { // new slice fits, just copying
+	} else {
 		newStorage.slice = newStorage.slice[:copy(newStorage.slice[:cap(newStorage.slice)], s.slice)]
 	}
 }

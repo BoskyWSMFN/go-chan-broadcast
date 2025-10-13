@@ -65,7 +65,7 @@ func New[T any](buffer ...int) Broadcaster[T] {
 func (b *subscribersManagement[T]) Subscribe() Subscriber[T] {
 	s := b.subscribersPool.Get().(*channelManagement[T])
 	s.open()
-	b.appendChannel(s.activeChan)
+	b.appendChannel(s.getChannelFromAtomicPointer())
 
 	return s
 }
@@ -167,9 +167,11 @@ func (b *subscribersManagement[T]) write(ctx context.Context, data T, block bool
 	}
 }
 
-func getWriteFunc[T any](ctx context.Context, block bool) func(ch chan T, v T) {
+func getWriteFunc[T any](ctx context.Context, block bool) func(ch chan<- T, v T) {
 	if block {
-		return func(ch chan T, v T) {
+		return func(ch chan<- T, v T) {
+			defer func() { recover() }() // to mask send on closed panic.
+
 			select {
 			case ch <- v:
 			case <-ctx.Done():
@@ -177,7 +179,9 @@ func getWriteFunc[T any](ctx context.Context, block bool) func(ch chan T, v T) {
 		}
 	}
 
-	return func(ch chan T, v T) {
+	return func(ch chan<- T, v T) {
+		defer func() { recover() }() // to mask send on closed panic.
+
 		select {
 		case ch <- v:
 		default:

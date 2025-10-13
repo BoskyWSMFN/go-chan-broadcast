@@ -16,59 +16,79 @@ type (
 	}
 
 	channelManagement[T any] struct {
-		activeChan                chan T
-		activeChannelBuffer       int
+		ch                        atomic.Value
+		chBuffer                  int
 		chanRemoveFromBroadcaster func(chan T)
 		subscribersPool           *sync.Pool
-		closedChan                chan T
-		isClosed                  *atomic.Bool
+		oncer                     atomic.Pointer[sync.Once]
 	}
 )
 
 func newSubscriber[T any](
 	subscribersPool *sync.Pool,
 	chanRemoveFromBroadcaster func(chan T),
-	activeChannelBuffer int) *channelManagement[T] {
+	chBuffer int) *channelManagement[T] {
 	ch := &channelManagement[T]{
-		activeChan:                make(chan T, activeChannelBuffer),
-		activeChannelBuffer:       activeChannelBuffer,
+		chBuffer:                  chBuffer,
 		chanRemoveFromBroadcaster: chanRemoveFromBroadcaster,
 		subscribersPool:           subscribersPool,
-		closedChan:                make(chan T),
-		isClosed:                  new(atomic.Bool),
 	}
-
-	close(ch.closedChan)
 
 	return ch
 }
 
 // Read from channel. Read returns closed channel if dispatched.
 func (s *channelManagement[T]) Read() <-chan T {
-	if s.isClosed.Load() {
-		return s.closedChan
+	return s.getChannelFromAtomicPointer()
+}
+
+func (s *channelManagement[T]) getChannelFromAtomicPointer() chan T {
+	ch, ok := s.ch.Load().(chan T)
+	if !ok {
+		ch = make(chan T)
+
+		close(ch)
 	}
 
-	return s.activeChan
+	return ch
 }
 
 // Dispatch removes Subscriber's active channel from Broadcaster's active channels slice, drains it and
 // puts Subscriber itself to Broadcaster's Subscribers pool.
 func (s *channelManagement[T]) Dispatch() {
-	if s.isClosed.Swap(true) {
-		return
-	}
+	defer func() {
+		closedCh := make(chan T)
 
-	s.chanRemoveFromBroadcaster(s.activeChan)
-	s.drainActiveChannel()
-	s.subscribersPool.Put(s)
+		close(closedCh)
+
+		s.ch.Store(closedCh)
+		s.oncer.Store(nil)
+		s.subscribersPool.Put(s)
+	}()
+
+	if oncer := s.oncer.Load(); oncer != nil {
+		oncer.Do(func() {
+			ch := s.getChannelFromAtomicPointer()
+
+			s.chanRemoveFromBroadcaster(ch)
+			s.drainChannel(ch)
+
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		})
+	}
 }
 
 // drainActiveChannel to prevent infinite write blocks
-func (s *channelManagement[T]) drainActiveChannel() {
-	for ctr := 0; ctr <= s.activeChannelBuffer; ctr++ {
+func (s *channelManagement[T]) drainChannel(ch chan T) {
+	const doubleDrain = 2
+
+	for range s.chBuffer * doubleDrain {
 		select {
-		case <-s.activeChan:
+		case <-ch:
 		default:
 		}
 	}
@@ -76,5 +96,8 @@ func (s *channelManagement[T]) drainActiveChannel() {
 
 // open closed with Dispatch method Subscriber
 func (s *channelManagement[T]) open() {
-	s.isClosed.Store(false)
+	ch := make(chan T, s.chBuffer)
+
+	s.oncer.Store(new(sync.Once))
+	s.ch.Store(ch)
 }

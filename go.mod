@@ -1,3 +1,3 @@
 module github.com/BoskyWSMFN/go-chan-broadcast
 
-go 1.19
+go 1.22
