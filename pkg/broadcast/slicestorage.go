@@ -1,16 +1,18 @@
 package broadcast
 
 type (
-	// slice storage - storage for slice of active objects
+	// sliceStorage provides thread-safe storage for active channels using copy-on-write
 	sliceStorage[T any] struct {
 		slice []chan T // TODO linked list?
 	}
 )
 
+// newSliceStorage creates a new slice storage instance
 func newSliceStorage[T any]() *sliceStorage[T] {
 	return new(sliceStorage[T])
 }
 
+// copySliceTo copies the slice contents to a new storage instance
 func (s *sliceStorage[T]) copySliceTo(newStorage *sliceStorage[T]) {
 	// Ensure slices do not share the same backing array.
 	// If capacity of destination is insufficient, reallocate.
@@ -21,6 +23,7 @@ func (s *sliceStorage[T]) copySliceTo(newStorage *sliceStorage[T]) {
 	}
 }
 
+// appendValue adds a channel to the slice if not already present
 func (s *sliceStorage[T]) appendValue(v chan T) (appended bool) {
 	for _, sliceV := range s.slice {
 		if v == sliceV {
@@ -33,6 +36,7 @@ func (s *sliceStorage[T]) appendValue(v chan T) (appended bool) {
 	return true
 }
 
+// removeValue removes a channel from the slice if present
 func (s *sliceStorage[T]) removeValue(v chan T) (removed bool) {
 	var (
 		valueFound bool
