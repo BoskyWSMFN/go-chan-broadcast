@@ -1,4 +1,5 @@
 # go-chan-broadcast
+[![Go Reference](https://pkg.go.dev/badge/github.com/BoskyWSMFN/go-chan-broadcast.svg)](https://pkg.go.dev/github.com/BoskyWSMFN/go-chan-broadcast)
 
 # Go Broadcast Library
 
