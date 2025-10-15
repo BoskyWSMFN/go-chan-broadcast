@@ -118,6 +118,8 @@ func main() {
     }()
     
     time.Sleep(100 * time.Millisecond)
+
+    sub.Dispatch()
 }
 ```
 
