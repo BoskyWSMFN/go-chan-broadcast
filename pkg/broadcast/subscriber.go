@@ -10,10 +10,15 @@ type (
 	// Each subscriber receives its own copy of the data.
 	Subscriber[T any] interface {
 		// Read returns a channel for reading data.
-		// Returns a closed channel after Dispatch is called.
+		// The channel is closed immediately after Dispatch is called.
 		Read() <-chan T
-		// Dispatch unsubscribes the subscriber, closes the channel and returns
-		// resources to the pool for reuse. Subsequent calls are no-ops.
+		// Dispatch unsubscribes the subscriber, closes the channel,
+		// and returns internal resources to a pool for reuse.
+		//
+		// Must be called exactly once per Subscriber.
+		// Any use of the Subscriber (including additional Dispatch calls)
+		// after the first Dispatch may result in undefined behavior due to reuse
+		// of the underlying object from sync.Pool.
 		Dispatch()
 	}
 
@@ -60,17 +65,17 @@ func (s *channelManagement[T]) getChannelFromAtomicValue() chan T {
 	return ch
 }
 
-// Dispatch unsubscribes the subscriber, closes the channel and returns
-// resources to the pool for reuse. Subsequent calls are no-ops.
+// Dispatch unsubscribes the subscriber, closes the channel,
+// and returns internal resources to a pool for reuse.
+//
+// Must be called exactly once per Subscriber.
+// Any use of the Subscriber (including additional Dispatch calls)
+// after the first Dispatch may result in undefined behavior due to reuse
+// of the underlying object from sync.Pool.
 func (s *channelManagement[T]) Dispatch() {
 	if oncer := s.oncer.Load(); oncer != nil {
 		oncer.Do(func() {
 			defer func() {
-				closedCh := make(chan T)
-
-				close(closedCh)
-
-				s.ch.Store(closedCh)
 				s.oncer.Store(nil)
 				s.subscribersPool.Put(s)
 			}()

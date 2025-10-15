@@ -26,51 +26,51 @@ go get github.com/BoskyWSMFN/go-chan-broadcast
 package main
 
 import (
-    "context"
-    "fmt"
-    "time"
-    
-    "github.com/BoskyWSMFN/go-chan-broadcast/pkg/broadcast"
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/BoskyWSMFN/go-chan-broadcast/pkg/broadcast"
 )
 
 func main() {
-    // Create a broadcaster with buffer size 10
-    bc := broadcast.New[int](10)
-    
-    // Create subscribers
-    sub1 := bc.Subscribe()
-    sub2 := bc.Subscribe()
-    
-    // Start readers
-    go func() {
-        // Cleanup sub1 when this goroutine exits
-        defer sub1.Dispatch()
-		
-        for msg := range sub1.Read() {
-            fmt.Printf("Subscriber 1 received: %d\n", msg)
-        }
-        fmt.Println("Subscriber 1 closed")
-    }()
-    
-    go func() {
-        // Cleanup sub2 when this goroutine exits
-        defer sub2.Dispatch()
-		
-        for msg := range sub2.Read() {
-            fmt.Printf("Subscriber 2 received: %d\n", msg)
-        }
-        fmt.Println("Subscriber 2 closed")
-    }()
-    
-    // Broadcast messages
-    bc.WriteNonBlock(1)    // Non-blocking send
-    bc.WriteBlock(2)       // Blocking send
-    bc.WriteCtx(context.Background(), 3) // Context-aware send
-    
-    // Asynchronous send
-    bc.DetachAndWrite(context.Background(), 4)
-    
-    time.Sleep(100 * time.Millisecond)
+	// Create a broadcaster with buffer size 10
+	bc := broadcast.New[int](10)
+
+	// Create subscribers
+	sub1 := bc.Subscribe()
+	sub2 := bc.Subscribe()
+
+	// Start readers
+	go func() {
+		// Cleanup sub1 when this goroutine exits
+		defer sub1.Dispatch()
+
+		for msg := range sub1.Read() {
+			fmt.Printf("Subscriber 1 received: %d\n", msg)
+		}
+		fmt.Println("Subscriber 1 closed")
+	}()
+
+	go func() {
+		// Cleanup sub2 when this goroutine exits
+		defer sub2.Dispatch()
+
+		for msg := range sub2.Read() {
+			fmt.Printf("Subscriber 2 received: %d\n", msg)
+		}
+		fmt.Println("Subscriber 2 closed")
+	}()
+
+	// Broadcast messages
+	bc.WriteNonBlock(1)    // Non-blocking send
+	bc.WriteBlock(2)       // Blocking send
+	bc.WriteCtx(context.Background(), 3) // Context-aware send
+
+	// Asynchronous send
+	bc.DetachAndWrite(context.Background(), 4)
+
+	time.Sleep(100 * time.Millisecond)
 }
 ```
 ### Channel Publisher Pattern
@@ -78,48 +78,47 @@ func main() {
 package main
 
 import (
-    "context"
-    "fmt"
-    "time"
+	"context"
+	"fmt"
+	"time"
 
-    "github.com/BoskyWSMFN/go-chan-broadcast/pkg/broadcast"
+	"github.com/BoskyWSMFN/go-chan-broadcast/pkg/broadcast"
 )
 
 func main() {
-    bc := broadcast.New[string](5)
-    
-    // Create publisher with context for graceful shutdown
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
-    
-    publisher := bc.PublisherCtx(ctx)
-    defer close(publisher) // Always close the publisher channel
-    
-    // Use familiar channel patterns
-    go func() {
-        messages := []string{"hello", "world", "broadcast"}
-        for _, msg := range messages {
-            select {
-            case publisher <- msg:
-                fmt.Printf("Published: %s\n", msg)
-            case <-ctx.Done():
-                return
-            }
-        }
-    }()
-    
-    // Create subscriber
-    sub := bc.Subscribe()
-    go func() {
-        defer sub.Dispatch()
-        for msg := range sub.Read() {
-            fmt.Printf("Received: %s\n", msg)
-        }
-    }()
-    
-    time.Sleep(100 * time.Millisecond)
+	bc := broadcast.New[string](5)
 
-    sub.Dispatch()
+	// Create publisher with context for graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	publisher := bc.PublisherCtx(ctx)
+	defer close(publisher) // Always close the publisher channel
+
+	// Use familiar channel patterns
+	go func() {
+		messages := []string{"hello", "world", "broadcast"}
+		for _, msg := range messages {
+			select {
+			case publisher <- msg:
+				fmt.Printf("Published: %s\n", msg)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Create subscriber
+	sub := bc.Subscribe()
+	go func() {
+		for msg := range sub.Read() {
+			fmt.Printf("Received: %s\n", msg)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	sub.Dispatch()
 }
 ```
 
@@ -129,28 +128,28 @@ func main() {
 
 ```go
 type Broadcaster[T any] interface {
-    // Publisher returns a send-only channel for convenient broadcasting
-    // Uses context.Background(). Close the channel to prevent goroutine leaks.
-    Publisher() chan<- T
+	// Publisher returns a send-only channel for convenient broadcasting 
+	// Uses context.Background(). Close the channel to prevent goroutine leaks. 
+	Publisher() chan<- T
 
-    // PublisherCtx returns a context-aware send-only channel  
-    // Respects context cancellation and channel closure.
-    PublisherCtx(ctx context.Context) chan<- T
+	// PublisherCtx returns a context-aware send-only channel  
+	// Respects context cancellation and channel closure.
+	PublisherCtx(ctx context.Context) chan<- T
 
-    // Subscribe creates a new subscriber
-    Subscribe() Subscriber[T]
-    
-    // WriteNonBlock - non-blocking send (may drop messages)
-    WriteNonBlock(T)
-    
-    // WriteBlock - blocking send (may block indefinitely)
-    WriteBlock(T)
-    
-    // WriteCtx - context-aware blocking send (recommended)
-    WriteCtx(context.Context, T)
-    
-    // DetachAndWrite - asynchronous send (fire-and-forget)
-    DetachAndWrite(ctx context.Context, data T)
+	// Subscribe creates a new subscriber
+	Subscribe() Subscriber[T]
+
+	// WriteNonBlock - non-blocking send (may drop messages)
+	WriteNonBlock(T)
+
+	// WriteBlock - blocking send (may block indefinitely)
+	WriteBlock(T)
+
+	// WriteCtx - context-aware blocking send (recommended)
+	WriteCtx(context.Context, T)
+	
+	// DetachAndWrite - asynchronous send (fire-and-forget)
+	DetachAndWrite(ctx context.Context, data T)
 }
 ```
 
@@ -158,13 +157,13 @@ type Broadcaster[T any] interface {
 
 ```go
 type Subscriber[T any] interface {
-    // Read returns the receive channel for reading broadcast messages
-    // Channel closes when Dispatch() is called
-    Read() <-chan T
+	// Read returns a channel for reading messages.
+	// Channel closes after Dispatch() is called.
+	Read() <-chan T
 
-    // Dispatch unsubscribes, closes the channel, and returns resources to pool 
-    //Idempotent - safe to call multiple times
-    Dispatch()
+	// Dispatch unsubscribes and releases resources.
+	// Call exactly once per subscriber.
+	Dispatch()
 }
 ```
 
@@ -188,10 +187,10 @@ type Subscriber[T any] interface {
 ```go
 // ✅ Recommended - use defer for guaranteed cleanup
 go func() {
-    defer sub.Dispatch() // Cleanup even if goroutine panics
-    for msg := range sub.Read() {
-    // process message
-    }
+	defer sub.Dispatch() // Cleanup even if goroutine panics
+	for msg := range sub.Read() {
+	// process message
+	}
 }()
 
 // ✅ Recommended for publishers  
@@ -200,10 +199,10 @@ defer close(publisher) // Prevent goroutine leaks
 
 // ❌ Avoid - may leak resources
 go func() {
-    for msg := range sub.Read() {
-    // process message
-    }
-    sub.Dispatch() // Might not execute if goroutine exits unexpectedly
+	for msg := range sub.Read() {
+	// process message
+	}
+	sub.Dispatch() // Might not execute if goroutine exits unexpectedly
 }()
 ```
 2. **Choose the Right Send Method**
