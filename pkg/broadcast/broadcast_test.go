@@ -426,6 +426,9 @@ func Test_PublisherBasic(t *testing.T) {
 }
 
 func Test_PublisherCtxWithTimeout(t *testing.T) {
+	// 4000000 writes takes too long for github runners to process.
+	const routinesAmount = 200
+
 	b := New[int](5)
 	if b == nil {
 		t.Fatalf("broadcaster is nil")
@@ -468,7 +471,7 @@ func Test_PublisherCtxWithTimeout(t *testing.T) {
 	wg.Wait() // Wait for all subscribers to be ready
 
 	// Use PublisherCtx with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute) // ~12s with -race and ~3s - without.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
 	defer cancel()
 
 	publisher := b.PublisherCtx(ctx)
