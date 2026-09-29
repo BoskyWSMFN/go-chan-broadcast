@@ -1,6 +1,7 @@
 package broadcast
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 )
@@ -11,38 +12,115 @@ type (
 	Subscriber[T any] interface {
 		// Read returns a channel for reading data.
 		// The channel is closed immediately after Dispatch is called.
+		//
+		// Calling Read after Dispatch returns a closed channel.
+		// Calling Read concurrently with Dispatch is safe, but the
+		// returned channel may be closed at any moment.
 		Read() <-chan T
+
 		// Dispatch unsubscribes the subscriber, closes the channel,
 		// and returns internal resources to a pool for reuse.
 		//
 		// Must be called exactly once per Subscriber.
 		// Any use of the Subscriber (including additional Dispatch calls)
-		// after the first Dispatch may result in undefined behavior due to reuse
-		// of the underlying object from sync.Pool.
+		// after the first Dispatch may result in undefined behavior due to
+		// reuse of the underlying object from sync.Pool.
+		//
+		// Dispatch may block until any in-flight WriteCtx/WriteBlock call
+		// targeting this subscriber finishes (or its context is canceled).
+		// With WriteNonBlock, Dispatch does not block.
 		Dispatch()
+
+		// Len returns the number of elements currently buffered in the
+		// subscriber's channel. For an unbuffered channel it always returns 0.
+		//
+		// Len is intended for diagnostics only and must not be used for
+		// synchronization.
+		Len() int
+
+		// Cap returns the buffer capacity of the subscriber's channel.
+		//
+		// Cap is intended for diagnostics only and must not be used for
+		// synchronization.
+		Cap() int
 	}
 
-	// channelManagement implements subscriber using atomic operations and object pooling
+	// channelManagement implements Subscriber using atomic operations and
+	// object pooling.
+	//
+	// Lifecycle:
+	//   - A fresh instance is created by newSubscriber with closed ch and done
+	//     channels, so any write before open() is a no-op.
+	//   - Subscribe calls open(), which installs fresh ch/done channels under mu.
+	//   - Dispatch removes the subscriber from the broadcaster, closes ch and
+	//     done, and returns the instance to subscribersPool.
+	//   - The instance may then be reused by a subsequent Subscribe.
+	//
+	// Concurrency:
+	//   - mu guards the close-vs-send race: Dispatch closes ch under mu.Lock,
+	//     while write/writeNonBlock send under mu.RLock and hold it for the
+	//     duration of the select.
+	//   - done is closed by Dispatch before taking mu.Lock, so that a writer
+	//     blocked in select can observe the cancellation and release RLock,
+	//     allowing Dispatch to proceed. Closing done under the lock would
+	//     deadlock against a writer waiting on done.
+	//   - oncer is stored as an atomic pointer because sync.Once cannot be
+	//     reset after use, and instances are reused across Subscribe calls.
 	channelManagement[T any] struct {
-		ch                        atomic.Value
-		chBuffer                  atomic.Int32
-		chanRemoveFromBroadcaster func(chan T)
-		subscribersPool           *sync.Pool
-		oncer                     atomic.Pointer[sync.Once]
+		// mu serializes channel close (Dispatch) against channel send
+		// (write/writeNonBlock). It is also held by open() while swapping
+		// ch and done to prevent writers from observing a partially
+		// initialized state.
+		mu sync.RWMutex
+
+		// ch holds the current data channel as a chan T.
+		// Accessed via getChannelFromAtomicValue.
+		ch atomic.Value
+
+		// chBuffer mirrors the buffer size passed to open, so that Cap()
+		// can report it without touching the channel.
+		chBuffer atomic.Int32
+
+		// chanRemoveFromBroadcaster removes this subscriber from the
+		// broadcaster's active list. Set once at construction.
+		chanRemoveFromBroadcaster func(*channelManagement[T])
+
+		// subscribersPool is the pool this instance belongs to. Dispatch
+		// returns the instance here.
+		subscribersPool *sync.Pool
+
+		// oncer guards Dispatch so that only the first call performs cleanup.
+		// It is replaced on every open() and cleared on every Dispatch.
+		oncer atomic.Pointer[sync.Once]
+
+		// notifyExitCh is closed by Dispatch to signal writers blocked in
+		// select that they should stop. Accessed via done.
+		notifyExitCh atomic.Value
 	}
 )
 
-// newSubscriber creates a new subscriber instance
+// newSubscriber creates a new subscriber instance.
+//
+// The returned instance is in a "dispatched" state: its ch and done channels
+// are closed, so any write before open() is a no-op. The instance becomes
+// usable only after open() is called.
 func newSubscriber[T any](
 	subscribersPool *sync.Pool,
-	chanRemoveFromBroadcaster func(chan T),
-	chBuffer int) *channelManagement[T] {
+	chanRemoveFromBroadcaster func(management *channelManagement[T]),
+) *channelManagement[T] {
 	ch := &channelManagement[T]{
 		chanRemoveFromBroadcaster: chanRemoveFromBroadcaster,
 		subscribersPool:           subscribersPool,
 	}
 
-	ch.chBuffer.Store(int32(chBuffer))
+	notifyExitCh := make(chan struct{})
+	close(notifyExitCh)
+
+	initClosedCh := make(chan T)
+	close(initClosedCh)
+
+	ch.notifyExitCh.Store(notifyExitCh)
+	ch.ch.Store(initClosedCh)
 
 	return ch
 }
@@ -53,25 +131,35 @@ func (s *channelManagement[T]) Read() <-chan T {
 	return s.getChannelFromAtomicValue()
 }
 
-// getChannelFromAtomicValue safely retrieves the channel from atomic.Value
-func (s *channelManagement[T]) getChannelFromAtomicValue() chan T {
-	ch, ok := s.ch.Load().(chan T)
-	if !ok {
-		ch = make(chan T)
-
-		close(ch)
-	}
-
-	return ch
+// Len returns the number of elements buffered in the current channel.
+func (s *channelManagement[T]) Len() int {
+	return len(s.getChannelFromAtomicValue())
 }
 
-// Dispatch unsubscribes the subscriber, closes the channel,
-// and returns internal resources to a pool for reuse.
+// Cap returns the buffer capacity of the current channel.
+func (s *channelManagement[T]) Cap() int {
+	return int(s.chBuffer.Load())
+}
+
+// getChannelFromAtomicValue safely retrieves the current data channel.
+//
+// The channel is never nil: before open() it is a closed channel installed
+// by newSubscriber.
+func (s *channelManagement[T]) getChannelFromAtomicValue() chan T {
+	return s.ch.Load().(chan T)
+}
+
+// Dispatch unsubscribes the subscriber, closes the channel, and returns
+// internal resources to subscribersPool for reuse.
 //
 // Must be called exactly once per Subscriber.
-// Any use of the Subscriber (including additional Dispatch calls)
-// after the first Dispatch may result in undefined behavior due to reuse
-// of the underlying object from sync.Pool.
+// Any use of the Subscriber (including additional Dispatch calls) after
+// the first Dispatch may result in undefined behavior due to reuse of the
+// underlying object from sync.Pool.
+//
+// Dispatch may block on mu.Lock if a writer is currently blocked in select
+// under mu.RLock. Closing done before taking mu.Lock ensures that such a
+// writer is woken up and releases RLock promptly.
 func (s *channelManagement[T]) Dispatch() {
 	if oncer := s.oncer.Load(); oncer != nil {
 		oncer.Do(func() {
@@ -80,36 +168,106 @@ func (s *channelManagement[T]) Dispatch() {
 				s.subscribersPool.Put(s)
 			}()
 
-			ch := s.getChannelFromAtomicValue()
+			s.chanRemoveFromBroadcaster(s)
 
-			s.chanRemoveFromBroadcaster(ch)
-			s.drainChannel(ch)
+			// Close done before acquiring mu so that a writer blocked in
+			// select can observe cancellation and release RLock. Closing
+			// done under mu.Lock would deadlock against such a writer.
+			close(s.notifyExitCh.Load().(chan struct{}))
 
-			select {
-			case <-ch:
-			default:
-				close(ch)
-			}
+			// Acquire mu to serialize against in-flight sends. After this
+			// point no new sends can start, and any in-flight send has
+			// already left its select.
+			s.mu.Lock()
+			close(s.getChannelFromAtomicValue())
+			s.mu.Unlock()
 		})
 	}
 }
 
-// drainChannel drains remaining messages to prevent goroutine leaks
-func (s *channelManagement[T]) drainChannel(ch chan T) {
-	const doubleDrain = 2
+// open re-activates a previously dispatched subscriber, installing fresh
+// ch/done channels and resetting oncer.
+//
+// open is called by Subscribe after retrieving the instance from the pool.
+// It takes mu.Lock so that writers never observe a partially initialized
+// state (e.g. new ch with old done, or vice versa).
+func (s *channelManagement[T]) open(buffer int) {
+	ch := make(chan T, buffer)
 
-	for range s.chBuffer.Load() * doubleDrain {
-		select {
-		case <-ch:
-		default:
-		}
+	s.mu.Lock()
+	s.oncer.Store(new(sync.Once))
+	s.chBuffer.Store(int32(buffer))
+	s.notifyExitCh.Store(make(chan struct{}))
+	s.ch.Store(ch)
+	s.mu.Unlock()
+}
+
+// isDone reports whether done has been closed by Dispatch.
+//
+// isDone is only meaningful when called under s.mu.RLock: otherwise the
+// result may be stale by the time the caller acts on it.
+func (s *channelManagement[T]) isDone() bool {
+	select {
+	case <-s.done():
+		return true
+	default:
+		return false
 	}
 }
 
-// open re-activates a previously dispatched subscriber
-func (s *channelManagement[T]) open() {
-	ch := make(chan T, s.chBuffer.Load())
+// done returns the current notification channel.
+func (s *channelManagement[T]) done() <-chan struct{} {
+	return s.notifyExitCh.Load().(chan struct{})
+}
 
-	s.oncer.Store(new(sync.Once))
-	s.ch.Store(ch)
+// write performs a blocking send of data to the subscriber's channel.
+//
+// write holds mu.RLock for the duration of the select, which prevents
+// Dispatch from closing ch underneath it. done is closed by Dispatch before
+// it acquires mu.Lock, so a writer blocked in select is guaranteed to be
+// woken up even if Dispatch is waiting for mu.Lock.
+//
+// write always calls wg.Done before returning, even if the send is skipped
+// because the subscriber has already been dispatched or the context is done.
+func (s *channelManagement[T]) write(ctx context.Context, wg *sync.WaitGroup, data T) {
+	defer wg.Done()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.isDone() {
+		return
+	}
+
+	select {
+	case s.getChannelFromAtomicValue() <- data:
+	case <-s.done():
+	case <-ctx.Done():
+	}
+}
+
+// writeNonBlock performs a non-blocking send of data to the subscriber's
+// channel.
+//
+// Returns true if the value was accepted by the channel, false if the
+// subscriber has been dispatched, the buffer is full, or the send would
+// have blocked.
+//
+// Like write, writeNonBlock holds mu.RLock for the duration of the select.
+func (s *channelManagement[T]) writeNonBlock(data T) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.isDone() {
+		return false
+	}
+
+	select {
+	case s.getChannelFromAtomicValue() <- data:
+		return true
+	case <-s.done():
+		return false
+	default:
+		return false
+	}
 }

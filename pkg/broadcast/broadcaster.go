@@ -4,15 +4,51 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type (
-	// Broadcaster allows one goroutine to write same T value to multiple goroutines concurrently.
-	// All methods are thread-safe.
+	// Broadcaster allows one goroutine to write the same T value to multiple
+	// goroutines concurrently.
+	//
+	// All methods are thread-safe and may be called from multiple goroutines.
+	//
+	// Delivery semantics depend on the write method:
+	//   - WriteNonBlock: non-blocking, may skip slow subscribers.
+	//   - WriteBlock:    blocking, waits indefinitely for all subscribers.
+	//   - WriteCtx:      blocking with cancellation and optional timeout.
+	//   - DetachAndWrite: like WriteCtx, but returns before delivery completes.
 	Broadcaster[T any] interface {
-		// Publisher returns a send-only channel that converts channel sends into broadcasts.
-		// Uses context.Background() internally. For context-aware publishing, use PublisherCtx.
-		// The returned channel can be used in standard Go patterns (range loops, select statements).
+		// WithBlockTimeout returns a copy of the broadcaster with the given
+		// per-write timeout.
+		//
+		// The timeout bounds how long WriteCtx/WriteBlock/DetachAndWrite wait
+		// for each subscriber before giving up on it. A zero timeout means no
+		// timeout (only the write context can cancel the wait).
+		//
+		// WithBlockTimeout shares state with the receiver: subscribers added
+		// via either instance are visible to both. Only the configuration is
+		// copied.
+		WithBlockTimeout(time.Duration) Broadcaster[T]
+
+		// WithBufferSize returns a copy of the broadcaster with the given
+		// subscriber channel buffer size.
+		//
+		// The new size applies only to subscribers created by the returned
+		// broadcaster via Subscribe. Existing subscribers keep their original
+		// buffer size. The publisher channel returned by Publisher/PublisherCtx
+		// also uses this size.
+		//
+		// WithBufferSize shares state with the receiver in the same way as
+		// WithBlockTimeout.
+		WithBufferSize(int) Broadcaster[T]
+
+		// Publisher returns a send-only channel that converts channel sends
+		// into broadcasts. Uses context.Background() internally.
+		// For context-aware publishing, use PublisherCtx.
+		//
+		// The returned channel can be used in standard Go patterns
+		// (e.g. select statements).
 		//
 		// Example:
 		//
@@ -22,12 +58,18 @@ type (
 		//	publisher <- data1  // Will be broadcast to all subscribers
 		//	publisher <- data2  // Will be broadcast to all subscribers
 		//
-		// WARNING: The goroutine handling the channel will leak if the channel is never closed.
-		// Caller is responsible for closing the channel.
+		// Each send is handled by a dedicated goroutine that calls WriteCtx
+		// with context.Background(). Consequently, a slow subscriber blocks
+		// subsequent sends on the returned channel.
+		//
+		// WARNING: The goroutine handling the channel will leak if the channel
+		// is never closed. Caller is responsible for closing the channel.
 		Publisher() chan<- T
-		// PublisherCtx returns a send-only channel that converts channel sends into context-aware broadcasts.
-		// The publisher respects context cancellation - if the context is canceled, the publisher
-		// stops processing messages and the goroutine exits.
+
+		// PublisherCtx returns a send-only channel that converts channel sends
+		// into context-aware broadcasts. The publisher respects context
+		// cancellation - if the context is canceled, the publisher stops
+		// processing messages and the goroutine exits.
 		//
 		// Example with context:
 		//
@@ -53,38 +95,103 @@ type (
 		//	    }
 		//	}
 		//
-		// The caller MUST close the returned channel to prevent goroutine leaks, OR ensure
-		// the context eventually gets canceled.
+		// Each send is handled by a dedicated goroutine that calls WriteCtx
+		// with the provided context. A slow subscriber blocks subsequent sends
+		// on the returned channel.
+		//
+		// The caller MUST close the returned channel to prevent goroutine
+		// leaks, OR ensure the context eventually gets canceled.
 		PublisherCtx(ctx context.Context) chan<- T
-		// Subscribe creates a new subscriber and adds its channel to the broadcaster's active channels list.
+
+		// Subscribe creates a new subscriber and adds its channel to the
+		// broadcaster's active list.
+		//
+		// The returned Subscriber must be released with Dispatch.
+		// The subscriber's channel buffer size is determined by the
+		// broadcaster's current configuration (see WithBufferSize).
 		Subscribe() Subscriber[T]
-		// DetachAndWrite asynchronously writes data (equivalent to "go WriteCtx()").
-		// WARNING: possible resource leak when using context.Background() or other non-cancellable contexts.
+
+		// DetachAndWrite asynchronously writes data to all current subscribers
+		// (equivalent to "go WriteCtx(ctx, data)").
+		//
+		// The call returns immediately; delivery proceeds in the background.
+		// The per-subscriber wait is bounded by blockTimeout and ctx. If both
+		// are non-cancellable, the background goroutine may leak.
+		//
+		// WARNING: possible resource leak when using context.Background() or
+		// other non-cancellable contexts without a block timeout.
 		DetachAndWrite(context.Context, T)
+
 		// WriteNonBlock uses non-blocking send (select-default).
-		// Data may be missed by some subscribers when their channels are full.
+		//
+		// Returns false if the data was not accepted by at least one
+		// subscriber, either because its buffer was full or because it had
+		// already been dispatched. Returns true only if every subscriber
+		// accepted the data.
+		//
 		// Use WriteCtx or WriteBlock for guaranteed delivery.
-		WriteNonBlock(T)
+		WriteNonBlock(T) bool
+
 		// WriteBlock uses blocking send with context.Background().
-		// May block indefinitely if there are no active readers.
+		//
+		// Waits for every subscriber to accept the data, or for blockTimeout
+		// to elapse (if configured). May block indefinitely if there are no
+		// active readers and blockTimeout is zero.
 		WriteBlock(T)
+
 		// WriteCtx uses context-aware send with cancellation support.
+		//
+		// Waits for every subscriber to accept the data, for ctx to be
+		// canceled, or for blockTimeout to elapse (if configured).
+		//
 		// Recommended method for guaranteed delivery with lifecycle control.
 		WriteCtx(context.Context, T)
 	}
 
-	// subscribersManagement implements the core broadcaster logic using atomic operations
+	// subscribersManagement implements Broadcaster using atomic operations
 	// and object pools to minimize lock contention and GC pressure.
+	//
+	// The active subscriber list is stored as an immutable slice wrapped in
+	// atomic.Pointer[sliceStorage]. Mutations (Subscribe/Dispatch) use
+	// copy-on-write with a compare-and-swap loop, so readers of the list
+	// (write paths) never block and never observe partial updates.
+	//
+	// Configuration is copied by value when WithBlockTimeout / WithBufferSize
+	// are called. The shared state (channelsManagers, pools) is referenced by
+	// pointer, so all derived broadcasters observe the same subscriber set.
 	subscribersManagement[T any] struct {
-		channels            *atomic.Pointer[sliceStorage[T]]
-		sliceStoragesPool   *sync.Pool
-		subscribersPool     *sync.Pool
-		waitGroupsPool      *sync.Pool
+		// channelsManagers points to the current immutable snapshot of active
+		// subscribers.
+		channelsManagers *atomic.Pointer[sliceStorage[T]]
+
+		// sliceStoragesPool reuses sliceStorage objects across CAS iterations
+		// and write iterations. Cleared on Put by putSliceStorageToPool.
+		sliceStoragesPool *sync.Pool
+
+		// subscribersPool reuses channelManagement objects across
+		// Subscribe/Dispatch cycles.
+		subscribersPool *sync.Pool
+
+		// waitGroupsPool reuses sync.WaitGroup objects used by write.
+		waitGroupsPool *sync.Pool
+
+		// blockTimeout bounds how long write waits for each subscriber.
+		// Zero means no timeout.
+		blockTimeout time.Duration
+
+		// publisherBufferSize is the buffer size for both publisher channels
+		// (Publisher/PublisherCtx) and subscriber channels opened by Subscribe.
 		publisherBufferSize int
 	}
 )
 
-// New creates a channel-like Broadcaster. Buffer length may be passed as first argument. Args[1:] are ignored.
+// New creates a channel-like Broadcaster.
+//
+// Buffer length may be passed as the first variadic argument; it sets the
+// buffer size of publisher channels and of subscriber channels created by
+// Subscribe. Additional arguments are ignored.
+//
+// The returned Broadcaster is ready to use. Its subscriber list is empty.
 func New[T any](buffer ...int) Broadcaster[T] {
 	var buf int
 	if len(buffer) > 0 {
@@ -92,10 +199,11 @@ func New[T any](buffer ...int) Broadcaster[T] {
 	}
 
 	c := &subscribersManagement[T]{
+		channelsManagers: new(atomic.Pointer[sliceStorage[T]]),
 		sliceStoragesPool: &sync.Pool{
 			New: func() any { return newSliceStorage[T]() },
 		},
-		channels: new(atomic.Pointer[sliceStorage[T]]),
+		subscribersPool: new(sync.Pool),
 		waitGroupsPool: &sync.Pool{
 			New: func() any {
 				return new(sync.WaitGroup)
@@ -103,24 +211,53 @@ func New[T any](buffer ...int) Broadcaster[T] {
 		},
 		publisherBufferSize: buf,
 	}
-	subscribersPool := new(sync.Pool)
-	subscribersPool.New = func() any {
+
+	// The subscriber pool must produce subscribers bound to this broadcaster,
+	// so that Dispatch removes them from the correct subscriber set.
+	c.subscribersPool.New = func() any {
 		return newSubscriber[T](
-			subscribersPool,
-			c.removeChannel,
-			buf,
+			c.subscribersPool,
+			c.removeChannelManagement,
 		)
 	}
-	c.subscribersPool = subscribersPool
 
-	c.channels.Store(c.getSliceStorageFromPool()) // never nil
+	c.channelsManagers.Store(c.getSliceStorageFromPool()) // never nil
 
 	return c
 }
 
-// Publisher returns a send-only channel that converts channel sends into broadcasts.
-// Uses context.Background() internally. For context-aware publishing, use PublisherCtx.
-// The returned channel can be used in standard Go patterns (range loops, select statements).
+// WithBlockTimeout returns a copy of b with the given per-write timeout.
+// Shared state (subscribers, pools) is referenced, not copied.
+func (b *subscribersManagement[T]) WithBlockTimeout(blockTimeout time.Duration) Broadcaster[T] {
+	return &subscribersManagement[T]{
+		channelsManagers:    b.channelsManagers,
+		sliceStoragesPool:   b.sliceStoragesPool,
+		subscribersPool:     b.subscribersPool,
+		waitGroupsPool:      b.waitGroupsPool,
+		blockTimeout:        blockTimeout,
+		publisherBufferSize: b.publisherBufferSize,
+	}
+}
+
+// WithBufferSize returns a copy of b with the given subscriber buffer size.
+// Shared state (subscribers, pools) is referenced, not copied.
+func (b *subscribersManagement[T]) WithBufferSize(bufferSize int) Broadcaster[T] {
+	return &subscribersManagement[T]{
+		channelsManagers:    b.channelsManagers,
+		sliceStoragesPool:   b.sliceStoragesPool,
+		subscribersPool:     b.subscribersPool,
+		waitGroupsPool:      b.waitGroupsPool,
+		blockTimeout:        b.blockTimeout,
+		publisherBufferSize: bufferSize,
+	}
+}
+
+// Publisher returns a send-only channel that converts channel sends into
+// broadcasts. Uses context.Background() internally.
+// For context-aware publishing, use PublisherCtx.
+//
+// The returned channel can be used in standard Go patterns (e.g.
+// select statements).
 //
 // Example:
 //
@@ -130,15 +267,20 @@ func New[T any](buffer ...int) Broadcaster[T] {
 //	publisher <- data1  // Will be broadcast to all subscribers
 //	publisher <- data2  // Will be broadcast to all subscribers
 //
-// WARNING: The goroutine handling the channel will leak if the channel is never closed.
-// Caller is responsible for closing the channel.
+// Each send is handled by a dedicated goroutine that calls WriteCtx with
+// context.Background(). Consequently, a slow subscriber blocks subsequent
+// sends on the returned channel.
+//
+// WARNING: The goroutine handling the channel will leak if the channel is
+// never closed. Caller is responsible for closing the channel.
 func (b *subscribersManagement[T]) Publisher() chan<- T {
 	return b.PublisherCtx(context.Background())
 }
 
-// PublisherCtx returns a send-only channel that converts channel sends into context-aware broadcasts.
-// The publisher respects context cancellation - if the context is canceled, the publisher
-// stops processing messages and the goroutine exits.
+// PublisherCtx returns a send-only channel that converts channel sends into
+// context-aware broadcasts. The publisher respects context cancellation - if
+// the context is canceled, the publisher stops processing messages and the
+// goroutine exits.
 //
 // Example with context:
 //
@@ -164,12 +306,16 @@ func (b *subscribersManagement[T]) Publisher() chan<- T {
 //	    }
 //	}
 //
-// The caller MUST close the returned channel to prevent goroutine leaks, OR ensure
-// the context eventually gets canceled.
+// Each send is handled by a dedicated goroutine that calls WriteCtx with the
+// provided context. A slow subscriber blocks subsequent sends on the returned
+// channel.
+//
+// The caller MUST close the returned channel to prevent goroutine leaks, OR
+// ensure the context eventually gets canceled.
 func (b *subscribersManagement[T]) PublisherCtx(ctx context.Context) chan<- T {
 	pubChan := make(chan T, b.publisherBufferSize)
 
-	go func(pubChan <-chan T) {
+	go func(b *subscribersManagement[T], pubChan <-chan T) {
 		for {
 			select {
 			case <-ctx.Done():
@@ -182,62 +328,102 @@ func (b *subscribersManagement[T]) PublisherCtx(ctx context.Context) chan<- T {
 				b.WriteCtx(ctx, data)
 			}
 		}
-	}(pubChan)
+	}(b, pubChan)
 
 	return pubChan
 }
 
-// Subscribe creates a new subscriber and adds its channel to the broadcaster's active channels list.
+// Subscribe creates a new subscriber and adds its channel to the
+// broadcaster's active list.
+//
+// The subscriber's channel buffer size is taken from the current
+// configuration (see WithBufferSize).
 func (b *subscribersManagement[T]) Subscribe() Subscriber[T] {
 	s := b.subscribersPool.Get().(*channelManagement[T])
-	s.open()
-	b.appendChannel(s.getChannelFromAtomicValue())
+
+	s.open(b.publisherBufferSize)
+	b.appendChannelManagement(s)
 
 	return s
 }
 
-// DetachAndWrite asynchronously writes data (equivalent to "go WriteCtx()").
-// WARNING: possible resource leak when using context.Background() or other non-cancellable contexts.
+// DetachAndWrite asynchronously writes data to all current subscribers
+// (equivalent to "go WriteCtx(ctx, data)").
+//
+// The call returns immediately; delivery proceeds in the background.
+// The per-subscriber wait is bounded by blockTimeout and ctx. If both are
+// non-cancellable, the background goroutine may leak.
+//
+// WARNING: possible resource leak when using context.Background() or other
+// non-cancellable contexts without a block timeout.
 func (b *subscribersManagement[T]) DetachAndWrite(ctx context.Context, data T) {
-	b.write(ctx, data, true, true)
+	b.write(ctx, data, true)
 }
 
 // WriteNonBlock uses non-blocking send (select-default).
-// Data may be missed by some subscribers when their channels are full.
+//
+// Returns false if the data was not accepted by at least one subscriber,
+// either because its buffer was full or because it had already been
+// dispatched. Returns true only if every subscriber accepted the data.
+//
 // Use WriteCtx or WriteBlock for guaranteed delivery.
-func (b *subscribersManagement[T]) WriteNonBlock(data T) {
-	b.write(context.Background(), data, false, false)
+func (b *subscribersManagement[T]) WriteNonBlock(data T) bool {
+	channelManagers := b.channelsManagers.Load()
+	if len(channelManagers.slice) == 0 {
+		return false
+	}
+
+	ok := true
+
+	for _, channelM := range channelManagers.slice {
+		if !channelM.writeNonBlock(data) {
+			ok = false
+		}
+	}
+
+	return ok
 }
 
 // WriteBlock uses blocking send with context.Background().
-// May block indefinitely if there are no active readers.
+//
+// Waits for every subscriber to accept the data, or for blockTimeout to
+// elapse (if configured). May block indefinitely if there are no active
+// readers and blockTimeout is zero.
 func (b *subscribersManagement[T]) WriteBlock(data T) { //nolint: unused
-	b.write(context.Background(), data, true, false)
+	b.write(context.Background(), data, false)
 }
 
 // WriteCtx uses context-aware send with cancellation support.
+//
+// Waits for every subscriber to accept the data, for ctx to be canceled,
+// or for blockTimeout to elapse (if configured).
+//
 // Recommended method for guaranteed delivery with lifecycle control.
 func (b *subscribersManagement[T]) WriteCtx(ctx context.Context, data T) {
-	b.write(ctx, data, true, false)
+	b.write(ctx, data, false)
 }
 
-// getSliceStorageFromPool retrieves a sliceStorage from the pool
+// getSliceStorageFromPool retrieves a sliceStorage from the pool.
 func (b *subscribersManagement[T]) getSliceStorageFromPool() *sliceStorage[T] {
 	return b.sliceStoragesPool.Get().(*sliceStorage[T])
 }
 
-// putSliceStorageToPool returns a sliceStorage to the pool
+// putSliceStorageToPool clears and returns a sliceStorage to the pool.
 func (b *subscribersManagement[T]) putSliceStorageToPool(s *sliceStorage[T]) {
+	s.clear()
 	b.sliceStoragesPool.Put(s)
 }
 
-// getCurrentAndCopiedSliceStorages atomically loads current slice storage and copies its contents
-// to a new storage retrieved from the pool.
+// getCurrentAndCopiedSliceStorages atomically loads the current slice storage
+// and copies its contents into a new storage retrieved from the pool.
+//
+// The returned copiedStorage is always a distinct object whose backing array
+// does not alias currentStorage, so it is safe to mutate before CAS.
 func (b *subscribersManagement[T]) getCurrentAndCopiedSliceStorages() (
 	currentStorage *sliceStorage[T],
 	copiedStorage *sliceStorage[T],
 ) {
-	currentStorage = b.channels.Load()
+	currentStorage = b.channelsManagers.Load()
 	copiedStorage = b.getSliceStorageFromPool()
 
 	currentStorage.copySliceTo(copiedStorage)
@@ -245,98 +431,101 @@ func (b *subscribersManagement[T]) getCurrentAndCopiedSliceStorages() (
 	return
 }
 
-// compareAndSwapCurrentAndCopiedSliceStorages performs CAS operation and manages pool returns
-func (b *subscribersManagement[T]) compareAndSwapCurrentAndCopiedSliceStorages(
-	currentStorage *sliceStorage[T],
-	copiedStorage *sliceStorage[T],
-) (
-	swapped bool,
-) {
-	if swapped = b.channels.CompareAndSwap(currentStorage, copiedStorage); !swapped {
-		b.putSliceStorageToPool(copiedStorage) // new (copied) storage must be put back to pool if not success
-	}
+// appendChannelManagement adds a subscriber to the active list using a CAS loop.
+//
+// The loop retries until the compare-and-swap succeeds, because concurrent
+// Subscribe/Dispatch calls may have replaced the snapshot in the meantime.
+// Each failed attempt returns its copiedStorage to the pool.
+//
+// If the subscriber is already present, the call is a no-op.
+func (b *subscribersManagement[T]) appendChannelManagement(chM *channelManagement[T]) {
+	for {
+		currentStorage, copiedStorage := b.getCurrentAndCopiedSliceStorages()
 
-	return
+		if !copiedStorage.appendValue(chM) {
+			b.putSliceStorageToPool(copiedStorage)
+
+			return
+		}
+
+		if b.channelsManagers.CompareAndSwap(currentStorage, copiedStorage) {
+			return
+		}
+
+		b.putSliceStorageToPool(copiedStorage)
+	}
 }
 
-// appendChannel adds a channel to the active channels list using CAS loop
-func (b *subscribersManagement[T]) appendChannel(ch chan T) {
-	currentStorage, copiedStorage := b.getCurrentAndCopiedSliceStorages()
+// removeChannelManagement removes a subscriber from the active list using a CAS loop.
+//
+// The loop retries until the compare-and-swap succeeds, because concurrent
+// Subscribe/Dispatch calls may have replaced the snapshot in the meantime.
+// Each failed attempt returns its copiedStorage to the pool.
+//
+// If the subscriber is not present, the call is a no-op.
+func (b *subscribersManagement[T]) removeChannelManagement(chM *channelManagement[T]) {
+	for {
+		currentStorage, copiedStorage := b.getCurrentAndCopiedSliceStorages()
 
-	if !copiedStorage.appendValue(ch) { // not appending if already contains
+		if !copiedStorage.removeValue(chM) {
+			b.putSliceStorageToPool(copiedStorage)
+
+			return
+		}
+
+		if b.channelsManagers.CompareAndSwap(currentStorage, copiedStorage) {
+			return
+		}
+
 		b.putSliceStorageToPool(copiedStorage)
+	}
+}
 
+// write broadcasts data to all subscribers currently in the active list.
+//
+// The subscriber set is snapshotted once at the start of the call; subscribers
+// added or removed concurrently are not observed. Each subscriber is written
+// to from its own goroutine, and the call waits (or does not wait, if detach
+// is true) for all of them via a pooled WaitGroup.
+//
+// The per-subscriber wait is bounded by blockTimeout (if configured) and by
+// ctx. If detach is true, the WaitGroup is returned to the pool from a
+// background goroutine and the caller does not block on delivery.
+func (b *subscribersManagement[T]) write(ctx context.Context, data T, detach bool) {
+	channelManagemers := b.channelsManagers.Load()
+	if len(channelManagemers.slice) == 0 {
 		return
 	}
 
-	if !b.compareAndSwapCurrentAndCopiedSliceStorages(currentStorage, copiedStorage) {
-		b.appendChannel(ch) // pointer has already been swapped, need one more try to prevent active channels lose
-	}
-}
+	var (
+		waitCtx context.Context
+		cancel  context.CancelFunc
+	)
 
-// removeChannel removes a channel from the active channels list using CAS loop
-func (b *subscribersManagement[T]) removeChannel(ch chan T) {
-	currentStorage, copiedStorage := b.getCurrentAndCopiedSliceStorages()
-
-	if !copiedStorage.removeValue(ch) { // not removing if doesn't contain
-		b.putSliceStorageToPool(copiedStorage)
-
-		return
+	if b.blockTimeout > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, b.blockTimeout)
+	} else {
+		waitCtx, cancel = context.WithCancel(ctx)
 	}
 
-	if !b.compareAndSwapCurrentAndCopiedSliceStorages(currentStorage, copiedStorage) {
-		b.removeChannel(ch) // pointer has already been swapped, need one more try to prevent active channels lose
-	}
-}
+	wg := b.waitGroupsPool.Get().(*sync.WaitGroup)
 
-// write broadcasts data to all subscribers with specified blocking behavior
-func (b *subscribersManagement[T]) write(ctx context.Context, data T, block, detach bool) {
-	wg, ok := b.waitGroupsPool.Get().(*sync.WaitGroup)
-	if !ok {
-		wg = new(sync.WaitGroup)
-	}
+	wg.Add(len(channelManagemers.slice))
 
-	writeFunc := getWriteFunc[T](ctx, wg, block)
-	channels := b.channels.Load()
-
-	wg.Add(len(channels.slice))
-
-	for _, channel := range channels.slice {
-		go writeFunc(channel, data)
+	for _, channelM := range channelManagemers.slice {
+		go channelM.write(waitCtx, wg, data)
 	}
 
 	if !detach {
-		wg.Wait()
-		b.waitGroupsPool.Put(wg)
+		waitAndPutWGToPool(cancel, wg, b.waitGroupsPool)
 	} else {
-		go func(wg *sync.WaitGroup, pool *sync.Pool) {
-			wg.Wait()
-			pool.Put(wg)
-		}(wg, b.waitGroupsPool)
+		go waitAndPutWGToPool(cancel, wg, b.waitGroupsPool)
 	}
 }
 
-// getWriteFunc returns appropriate write function based on blocking behavior
-func getWriteFunc[T any](ctx context.Context, wg *sync.WaitGroup, block bool) func(ch chan<- T, v T) {
-	if block {
-		return func(ch chan<- T, v T) {
-			defer func() { recover() }() // to mask send on closed panic.
-			defer wg.Done()
+func waitAndPutWGToPool(cancel context.CancelFunc, wg *sync.WaitGroup, pool *sync.Pool) {
+	defer cancel()
+	defer pool.Put(wg)
 
-			select {
-			case ch <- v:
-			case <-ctx.Done():
-			}
-		}
-	}
-
-	return func(ch chan<- T, v T) {
-		defer func() { recover() }() // to mask send on closed panic.
-		defer wg.Done()
-
-		select {
-		case ch <- v:
-		default:
-		}
-	}
+	wg.Wait()
 }

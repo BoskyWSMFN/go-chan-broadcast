@@ -3,16 +3,22 @@
 
 # Go Broadcast Library
 
-A high-performance, lock-free broadcaster implementation for Go that allows one goroutine to efficiently broadcast messages to multiple subscribers.
+A high-performance broadcaster for Go that allows one goroutine to efficiently
+broadcast messages to multiple subscribers.
 
 ## Features
 
-- **Lock-free Design**: Uses atomic operations and CAS loops instead of heavy mutexes
-- **Object Pooling**: Minimizes GC pressure through efficient resource reuse
-- **Multiple Send Strategies**: Non-blocking, blocking, and context-aware sends
-- **Memory Safe**: Automatic channel management and leak prevention
-- **Generic**: Works with any data type using Go generics
-- **Thread-Safe**: All methods are safe for concurrent use
+- **Copy-on-write subscriber list**: active subscribers are stored in an
+  immutable snapshot behind `atomic.Pointer`, so write paths never block on
+  Subscribe/Dispatch.
+- **Object pooling**: objects are reused to minimize GC pressure.
+- **Multiple send strategies**: non-blocking, blocking, context-aware, and
+  fire-and-forget.
+- **Per-subscriber buffering** with configurable size.
+- **Configurable per-write timeout** (`WithBlockTimeout`) for bounding how long
+  a slow subscriber can stall a broadcast.
+- **Generic**: works with any data type using Go generics.
+- **Thread-safe**: all methods are safe for concurrent use.
 
 ## Installation
 
@@ -20,9 +26,10 @@ A high-performance, lock-free broadcaster implementation for Go that allows one 
 go get github.com/BoskyWSMFN/go-chan-broadcast
 ```
 
-
 ## Quick Start
+
 ### Basic usage
+
 ```go
 package main
 
@@ -35,18 +42,16 @@ import (
 )
 
 func main() {
-	// Create a broadcaster with buffer size 10
+	// Create a broadcaster with subscriber buffer size 10.
 	bc := broadcast.New[int](10)
 
-	// Create subscribers
 	sub1 := bc.Subscribe()
+	defer sub1.Dispatch()
+
 	sub2 := bc.Subscribe()
+	defer sub2.Dispatch()
 
-	// Start readers
 	go func() {
-		// Cleanup sub1 when this goroutine exits
-		defer sub1.Dispatch()
-
 		for msg := range sub1.Read() {
 			fmt.Printf("Subscriber 1 received: %d\n", msg)
 		}
@@ -54,27 +59,101 @@ func main() {
 	}()
 
 	go func() {
-		// Cleanup sub2 when this goroutine exits
-		defer sub2.Dispatch()
-
 		for msg := range sub2.Read() {
 			fmt.Printf("Subscriber 2 received: %d\n", msg)
 		}
 		fmt.Println("Subscriber 2 closed")
 	}()
 
-	// Broadcast messages
-	bc.WriteNonBlock(1)    // Non-blocking send
-	bc.WriteBlock(2)       // Blocking send
-	bc.WriteCtx(context.Background(), 3) // Context-aware send
+	// Non-blocking send: may skip subscribers whose buffer is full.
+	bc.WriteNonBlock(1)
 
-	// Asynchronous send
+	// Blocking send: waits for every subscriber.
+	bc.WriteBlock(2)
+
+	// Context-aware send: recommended for guaranteed delivery with lifecycle control.
+	bc.WriteCtx(context.Background(), 3)
+
+	// Fire-and-forget send: returns immediately, delivers in the background.
 	bc.DetachAndWrite(context.Background(), 4)
 
 	time.Sleep(100 * time.Millisecond)
 }
 ```
-### Channel Publisher Pattern
+
+### Reading with a cancellation context
+
+`range sub.Read()` stops only when `Dispatch` closes the channel. If the
+reader needs to stop earlier — for example, on application shutdown — use
+`select` between `Read()` and a `context.Done()` channel.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/BoskyWSMFN/go-chan-broadcast/pkg/broadcast"
+)
+
+func main() {
+	bc := broadcast.New[int](10)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	sub := bc.Subscribe()
+
+	// Reader goroutine exits when either:
+	//   - Dispatch closes the subscriber channel, or
+	//   - ctx is canceled (application shutdown, timeout, etc.).
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		defer sub.Dispatch() // Always release the subscriber.
+
+		for {
+			select {
+			case <-ctx.Done():
+				fmt.Println("Reader stopping: context canceled")
+				return
+			case msg, ok := <-sub.Read():
+				if !ok {
+					fmt.Println("Reader stopping: subscriber dispatched")
+					return
+				}
+				fmt.Printf("Received: %d\n", msg)
+			}
+		}
+	}()
+
+	// Broadcast a few messages.
+	bc.WriteNonBlock(1)
+	bc.WriteNonBlock(2)
+	bc.WriteNonBlock(3)
+
+	// Wait for the reader to finish (either by context or by Dispatch below).
+	<-done
+}
+```
+
+Notes:
+
+- `sub.Read()` returns `<-chan T`, so it can be used in `select` like any
+  other channel.
+- When the subscriber's channel is closed by `Dispatch`, the receive expression
+  yields the zero value of `T` and `ok == false`. Always check `ok` before
+  using the value.
+- Always call `Dispatch()` from the reader goroutine (or ensure it runs after
+  the reader exits). Calling `Dispatch` while another goroutine is blocked in
+  `<-sub.Read()` is safe — the channel is closed under a lock, and the reader
+  observes `ok == false`.
+
+### Channel Publisher pattern
+
 ```go
 package main
 
@@ -89,15 +168,17 @@ import (
 func main() {
 	bc := broadcast.New[string](5)
 
-	// Create publisher with context for graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	publisher := bc.PublisherCtx(ctx)
-	defer close(publisher) // Always close the publisher channel
+	defer close(publisher) // Always close the publisher channel.
 
-	// Use familiar channel patterns
+	sub := bc.Subscribe()
+	
 	go func() {
+		defer sub.Dispatch()
+		
 		messages := []string{"hello", "world", "broadcast"}
 		for _, msg := range messages {
 			select {
@@ -109,158 +190,343 @@ func main() {
 		}
 	}()
 
-	// Create subscriber
+	for msg := range sub.Read() {
+		fmt.Printf("Received: %s\n", msg)
+	}
+}
+```
+
+### Channel Publisher pattern with cancellable reader
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/BoskyWSMFN/go-chan-broadcast/pkg/broadcast"
+)
+
+func main() {
+	bc := broadcast.New[string](5)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	publisher := bc.PublisherCtx(ctx)
+	defer close(publisher) // Always close the publisher channel.
+
 	sub := bc.Subscribe()
+
+	// Reader goroutine stops when either Dispatch closes the subscriber
+	// channel, or ctx is canceled.
+	done := make(chan struct{})
+
 	go func() {
-		for msg := range sub.Read() {
-			fmt.Printf("Received: %s\n", msg)
+		defer close(done)
+		defer sub.Dispatch()
+
+		for {
+			select {
+			case <-ctx.Done():
+				fmt.Println("Reader stopping: context canceled")
+				return
+			case msg, ok := <-sub.Read():
+				if !ok {
+					fmt.Println("Reader stopping: subscriber dispatched")
+					return
+				}
+				fmt.Printf("Received: %s\n", msg)
+			}
 		}
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	// Publisher goroutine stops on context cancellation.
+	go func() {
+		messages := []string{"hello", "world", "broadcast"}
+		for _, msg := range messages {
+			select {
+			case publisher <- msg:
+				fmt.Printf("Published: %s\n", msg)
+			case <-ctx.Done():
+				fmt.Println("Publisher stopping: context canceled")
+				return
+			}
+		}
+	}()
 
-	sub.Dispatch()
+	// Wait for the reader to finish (context cancellation or timeout).
+	<-done
 }
+```
+
+Notes:
+
+- `PublisherCtx` runs a dedicated goroutine that reads from the returned
+  channel and calls `WriteCtx` for each message. Closing the channel
+  (`close(publisher)`) or canceling `ctx` terminates that goroutine.
+- A slow subscriber blocks subsequent sends on `publisher`. The `select`
+  on `ctx.Done()` lets the publisher goroutine exit instead of hanging
+  forever.
+- `defer sub.Dispatch()` runs in the reader goroutine, after the reader
+  exits. This avoids `Dispatch` waiting on an in-flight `WriteCtx` while
+  the reader is still consuming messages.
+
+### Bounding slow subscribers
+
+```go
+bc := broadcast.New[int](16).
+	WithBlockTimeout(500 * time.Millisecond)
+
+sub := bc.Subscribe()
+defer sub.Dispatch()
+
+// WriteCtx/WriteBlock/DetachAndWrite will wait at most 500ms per subscriber.
+// Subscribers that do not accept the value in time are skipped for this write.
+bc.WriteCtx(context.Background(), 42)
 ```
 
 ## API Reference
 
-### Broadcaster Interface
+### Broadcaster interface
 
 ```go
 type Broadcaster[T any] interface {
-	// Publisher returns a send-only channel for convenient broadcasting 
-	// Uses context.Background(). Close the channel to prevent goroutine leaks. 
+	// WithBlockTimeout returns a copy of the broadcaster with the given
+	// per-write timeout. Zero means no timeout.
+	WithBlockTimeout(time.Duration) Broadcaster[T]
+
+	// WithBufferSize returns a copy of the broadcaster with the given
+	// subscriber channel buffer size. Applies to subscribers created by
+	// the returned broadcaster via Subscribe, and to publisher channels.
+	WithBufferSize(int) Broadcaster[T]
+
+	// Publisher returns a send-only channel for convenient broadcasting.
+	// Uses context.Background(). Close the channel to prevent goroutine leaks.
 	Publisher() chan<- T
 
-	// PublisherCtx returns a context-aware send-only channel  
+	// PublisherCtx returns a context-aware send-only channel.
 	// Respects context cancellation and channel closure.
 	PublisherCtx(ctx context.Context) chan<- T
 
-	// Subscribe creates a new subscriber
+	// Subscribe creates a new subscriber. Release it with Dispatch.
 	Subscribe() Subscriber[T]
 
-	// WriteNonBlock - non-blocking send (may drop messages)
-	WriteNonBlock(T)
+	// WriteNonBlock - non-blocking send (may skip slow subscribers).
+	// Returns false if at least one subscriber did not accept the value.
+	WriteNonBlock(T) bool
 
-	// WriteBlock - blocking send (may block indefinitely)
+	// WriteBlock - blocking send with context.Background().
+	// May block indefinitely if there are no active readers and no timeout.
 	WriteBlock(T)
 
-	// WriteCtx - context-aware blocking send (recommended)
+	// WriteCtx - context-aware blocking send (recommended).
 	WriteCtx(context.Context, T)
-	
-	// DetachAndWrite - asynchronous send (fire-and-forget)
+
+	// DetachAndWrite - asynchronous send (fire-and-forget).
 	DetachAndWrite(ctx context.Context, data T)
 }
 ```
 
-### Subscriber Interface
+### Subscriber interface
 
 ```go
 type Subscriber[T any] interface {
 	// Read returns a channel for reading messages.
-	// Channel closes after Dispatch() is called.
+	// The channel is closed after Dispatch is called.
 	Read() <-chan T
 
-	// Dispatch unsubscribes and releases resources.
-	// Call exactly once per subscriber.
+	// Dispatch unsubscribes the subscriber, closes its channel,
+	// and returns internal resources to a pool for reuse.
+	// Must be called exactly once per subscriber.
 	Dispatch()
+
+	// Len returns the number of elements currently buffered in the
+	// subscriber's channel. Diagnostic only.
+	Len() int
+
+	// Cap returns the buffer capacity of the subscriber's channel.
+	// Diagnostic only.
+	Cap() int
 }
 ```
 
+## Delivery semantics
+
+| Method             | Blocks? | Guaranteed delivery? | Respects ctx? | Respects timeout? |
+|--------------------|---------|----------------------|---------------|-------------------|
+| `WriteNonBlock`    | No      | No                   | No            | No                |
+| `WriteBlock`       | Yes     | Yes                  | No            | Yes               |
+| `WriteCtx`         | Yes     | Yes                  | Yes           | Yes               |
+| `DetachAndWrite`   | No      | Background delivery  | Yes           | Yes               |
+
+Notes:
+- "Guaranteed delivery" means the call waits for every subscriber to accept
+  the value, or for the timeout / context cancellation to fire.
+- `DetachAndWrite` returns immediately.
+
 ## Performance Characteristics
 
-- **Subscribe/Unsubscribe**: O(n) due to slice copying, but uses object pooling
-- **Broadcast**: O(n) with concurrent sends to all subscribers
-- **Memory**: Efficient object reuse minimizes allocations
-- **Concurrency**: No lock contention during broadcasts
+Approximate costs on a modern x86-64 machine (AMD Ryzen 7 6800H, Go 1.27).
+Actual numbers depend on workload, buffer sizes, and scheduler state.
+
+| Operation                                  | Cost       | Allocations |
+|--------------------------------------------|-----------:|------------:|
+| `WriteNonBlock` (0 subscribers)            | ~3.5 ns    | 0           |
+| `WriteNonBlock` (1 subscriber, buf 16)     | ~88 ns     | 0           |
+| `WriteNonBlock` (100 subscribers, buf 16)  | ~57 µs     | 0           |
+| `WriteCtx` (1 subscriber, buf 16)          | ~1.1 µs    | 4           |
+| `WriteCtx` (100 subscribers, buf 16)       | ~83 µs     | 103         |
+| `Subscribe` + `Dispatch`                   | ~400–520 ns| 7–8         |
+
+Key observations:
+
+- **`WriteNonBlock` is allocation-free and an order of magnitude cheaper**
+  than `WriteCtx`. Prefer it when message loss is acceptable.
+- **`WriteCtx` is dominated by goroutine creation** (~1 µs fixed cost per
+  call plus ~800 ns per subscriber). The per-subscriber `RWMutex` is in the
+  noise (≈5 ns).
+- **`Subscribe`/`Dispatch` is the most expensive per-call operation** due to
+  channel creation and pool churn. Keep subscribers long-lived when possible.
+- **Buffer size affects latency**: large buffers (256+) hurt single-write
+  latency due to cache misses; small buffers (16) are a good default.
+
+Complexity:
+
+- **Subscribe/Dispatch**: O(n) — copy-on-write snapshot is copied on every
+  modification, then swapped in via CAS.
+- **Broadcast**: O(n) — one goroutine per subscriber in `WriteCtx`/`WriteBlock`.
+- **Memory**: O(n) — active subscriber list plus per-subscriber channels.
+
+Where n = number of active subscribers.
+
+## Concurrency model
+
+- **Subscribe/Dispatch** mutate the subscriber list using copy-on-write with
+  a CAS loop. Writers (`WriteNonBlock`/`WriteCtx`/...) load an immutable
+  snapshot and iterate it without locks.
+- **Each subscriber** owns an `RWMutex` that serializes channel close
+  (`Dispatch`) against channel send (`write`/`writeNonBlock`). `Dispatch`
+  closes the internal `done` channel **before** acquiring the lock, so a
+  writer blocked in `select` can observe cancellation and release the lock,
+  avoiding deadlock.
+- **`Dispatch` may block** if a writer is currently blocked in `select` on
+  that subscriber. With `WithBlockTimeout`, this wait is bounded.
 
 ## Use Cases
 
-- **Event Systems**: Broadcasting events to multiple handlers
-- **Pub/Sub Patterns**: One-to-many message distribution
-- **Service Coordination**: Notifying multiple goroutines of state changes
-- **Real-time Updates**: Distributing updates to connected clients
+- **Event systems**: broadcasting events to multiple handlers.
+- **Pub/Sub patterns**: one-to-many message distribution.
+- **Service coordination**: notifying multiple goroutines of state changes.
+- **Real-time updates**: distributing updates to connected clients.
 
 ## Best Practices
 
-1. **Always call Dispatch()**, **close Publishers** and **use Defer for Cleanup** when done to prevent leaks
+1. **Always call `Dispatch()` and close publishers.** Use `defer` for
+   guaranteed cleanup.
+
 ```go
-// ✅ Recommended - use defer for guaranteed cleanup
+// ✅ Recommended — use defer for guaranteed cleanup.
 go func() {
-	defer sub.Dispatch() // Cleanup even if goroutine panics
-	for msg := range sub.Read() {
-	// process message
+	defer sub.Dispatch()
+	select {
+	case msg, ok <- sub.Read():
+		// process message
+	case <-ctx.Done():
+		return
 	}
-}()
+}
 
-// ✅ Recommended for publishers  
+// ✅ Recommended for publishers.
 publisher := bc.PublisherCtx(ctx)
-defer close(publisher) // Prevent goroutine leaks
+defer close(publisher)
 
-// ❌ Avoid - may leak resources
+// ❌ Avoid — may leak resources if the goroutine exits unexpectedly.
 go func() {
-	for msg := range sub.Read() {
-	// process message
-	}
-	sub.Dispatch() // Might not execute if goroutine exits unexpectedly
+    select {
+    case msg, ok <- sub.Read():
+        // process message
+        sub.Dispatch()
+    case <-ctx.Done():
+        return
+    }
 }()
 ```
-2. **Choose the Right Send Method**
+
+2. **Choose the right send method.**
+
 ```go
-// For high-throughput, loss-tolerant scenarios
+// High-throughput, loss-tolerant.
 bc.WriteNonBlock(data)
 
-// For guaranteed delivery with timeout
+// Guaranteed delivery with a timeout.
 ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 defer cancel()
 bc.WriteCtx(ctx, data)
 
-// For fire-and-forget scenarios
+// Fire-and-forget.
 bc.DetachAndWrite(context.Background(), data)
 
-// Familiar channel interface for existing codebases
+// Familiar channel interface.
 publisher := bc.Publisher()
 publisher <- data
 ```
-3. **Choose appropriate buffer sizes** based on your throughput requirements
-4. **Handle context cancellation** for proper resource cleanup
+
+3. **Pick buffer sizes to match throughput.** Small buffers (e.g. 16) keep
+   single-write latency low; larger buffers help absorb bursts but cost more
+   per write.
+
+4. **Set `WithBlockTimeout` when subscribers may stall.** Without it, a single
+   slow subscriber can block a broadcast indefinitely.
+
+5. **Handle context cancellation** to release resources promptly.
 
 ## When to use this library vs alternatives
 
 ### Use this library when:
-- You need one-to-many message broadcasting
-- You want different send strategies (blocking/non-blocking)
-- You need per-subscriber buffering
-- You prefer channel-based APIs with Publisher()
-- Performance under high concurrency is critical
+- You need one-to-many message broadcasting.
+- You want different send strategies (blocking / non-blocking / context-aware).
+- You need per-subscriber buffering.
+- You prefer channel-based APIs via `Publisher()`.
+- Performance under high concurrency is critical.
 
-### Use sync.Cond when:
-- You need thread synchronization with wait/signal semantics
-- You're building low-level concurrency primitives
-- Simple condition variable pattern is sufficient
+### Use `sync.Cond` when:
+- You need thread synchronization with wait/signal semantics.
+- You are building low-level concurrency primitives.
+- A simple condition-variable pattern is sufficient.
 
 ### Use channels directly when:
-- You have simple one-to-one communication
-- The overhead of broadcaster isn't justified
-- You're building simple producer-consumer patterns
+- You have simple one-to-one communication.
+- The overhead of a broadcaster is not justified.
+- You are building simple producer–consumer patterns.
 
 ## Implementation notes
 
-### Channel Closing Semantics Note:
-This library intentionally violates the Go principle "only senders should close channels" for practical reasons.
-In the broadcaster pattern, the broadcaster (sender) cannot know when all subscribers are done receiving.
-Therefore, subscribers control their own channel lifecycle via `Dispatch()`.
+### Channel closing semantics
+
+This library intentionally violates the Go principle "only senders should
+close channels" for practical reasons. In a broadcast pattern, the broadcaster
+(the sender) cannot know when all subscribers are done receiving. Therefore
+subscribers control their own channel lifecycle via `Dispatch()`.
+
 This is a necessary trade-off for the broadcast pattern to work effectively.
+If you need strict sender-closes-channel semantics, use a plain channel per
+consumer instead.
 
-### Performance Characteristics Clarification:
-- **Subscribe/Unsubscribe**: O(n) - due to copying the entire slice of subscribers during CAS operations
-- **Broadcast**: O(n) - must send to n subscribers concurrently
-- **Memory**: O(n) - stores n channels in the slice
+### Performance characteristics clarification
 
-Where n = number of active subscribers.
-The copy-on-write approach with atomic operations avoids locks but requires full slice copies on modifications.
+- **Subscribe/Dispatch**: O(n) — the subscriber list is copied in full on
+  every mutation. The list is stored in `sliceStorage` objects that are
+  recycled through a `sync.Pool`.
+- **Broadcast**: O(n) — one goroutine per subscriber in `WriteCtx`/
+  `WriteBlock`. `WriteNonBlock` is synchronous and allocation-free.
+- **Memory**: O(n) — the active subscriber slice plus per-subscriber channels.
+
+Where n = number of active subscribers. The copy-on-write approach with atomic
+operations avoids locks but requires full slice copies on modifications.
 
 ## License
 
-BSD 2-Clause License - see LICENSE file for details.
+BSD 2-Clause License — see LICENSE file for details.

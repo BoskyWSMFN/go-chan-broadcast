@@ -667,3 +667,387 @@ func Test_PublisherChannelClosed(t *testing.T) {
 		t.Errorf("unexpected message received from closed publisher: %d", received)
 	}
 }
+
+func BenchmarkBroadcaster_SubscribeDispatch(b *testing.B) {
+	for _, subs := range []int{0, 1, 10} {
+		b.Run(subsName(subs), func(b *testing.B) {
+			bc := New[int](0)
+
+			existing := make([]Subscriber[int], 0, subs)
+			for i := 0; i < subs; i++ {
+				existing = append(existing, bc.Subscribe())
+			}
+			defer func() {
+				for _, s := range existing {
+					s.Dispatch()
+				}
+			}()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				s := bc.Subscribe()
+				s.Dispatch()
+			}
+		})
+	}
+}
+
+func BenchmarkBroadcaster_WriteNonBlock(b *testing.B) {
+	for _, subs := range []int{0, 1, 10, 100} {
+		b.Run(subsName(subs), func(b *testing.B) {
+			bc := New[int](16)
+
+			subscribers := make([]Subscriber[int], 0, subs)
+			for i := 0; i < subs; i++ {
+				subscribers = append(subscribers, bc.Subscribe())
+			}
+			defer func() {
+				for _, s := range subscribers {
+					s.Dispatch()
+				}
+			}()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var readerWg sync.WaitGroup
+			for _, s := range subscribers {
+				readerWg.Add(1)
+				go func(s Subscriber[int]) {
+					defer readerWg.Done()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case _, ok := <-s.Read():
+							if !ok {
+								return
+							}
+						}
+					}
+				}(s)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				bc.WriteNonBlock(i)
+			}
+
+			b.StopTimer()
+			cancel()
+			readerWg.Wait()
+		})
+	}
+}
+
+func BenchmarkBroadcaster_WriteCtx(b *testing.B) {
+	for _, subs := range []int{0, 1, 10, 100} {
+		b.Run(subsName(subs), func(b *testing.B) {
+			bc := New[int](16)
+
+			subscribers := make([]Subscriber[int], 0, subs)
+			for i := 0; i < subs; i++ {
+				subscribers = append(subscribers, bc.Subscribe())
+			}
+			defer func() {
+				for _, s := range subscribers {
+					s.Dispatch()
+				}
+			}()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var readerWg sync.WaitGroup
+			for _, s := range subscribers {
+				readerWg.Add(1)
+				go func(s Subscriber[int]) {
+					defer readerWg.Done()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case _, ok := <-s.Read():
+							if !ok {
+								return
+							}
+						}
+					}
+				}(s)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				bc.WriteCtx(ctx, i)
+			}
+
+			b.StopTimer()
+			cancel()
+			readerWg.Wait()
+		})
+	}
+}
+
+func BenchmarkBroadcaster_WriteCtx_WithTimeout(b *testing.B) {
+	for _, timeout := range []time.Duration{0, time.Millisecond, 10 * time.Millisecond} {
+		b.Run(timeoutName(timeout), func(b *testing.B) {
+			bc := New[int](16).WithBlockTimeout(timeout)
+
+			s := bc.Subscribe()
+			defer s.Dispatch()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var readerWg sync.WaitGroup
+			readerWg.Add(1)
+
+			go func() {
+				defer readerWg.Done()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case _, ok := <-s.Read():
+						if !ok {
+							return
+						}
+					}
+				}
+			}()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				bc.WriteCtx(ctx, i)
+			}
+
+			b.StopTimer()
+			cancel()
+			readerWg.Wait()
+		})
+	}
+}
+
+func BenchmarkBroadcaster_WriteCtx_SlowSubscriber(b *testing.B) {
+	for _, buf := range []int{0, 1, 16} {
+		b.Run(sizeName(buf), func(b *testing.B) {
+			bc := New[int](buf)
+
+			s := bc.Subscribe()
+			defer s.Dispatch()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				writeCtx, writeCancel := context.WithCancel(ctx)
+				writeCancel()
+
+				bc.WriteCtx(writeCtx, i)
+			}
+		})
+	}
+}
+
+func BenchmarkBroadcaster_Publisher(b *testing.B) {
+	for _, subs := range []int{1, 10, 100} {
+		b.Run(subsName(subs), func(b *testing.B) {
+			bc := New[int](0)
+
+			subscribers := make([]Subscriber[int], 0, subs)
+			for i := 0; i < subs; i++ {
+				subscribers = append(subscribers, bc.Subscribe())
+			}
+			defer func() {
+				for _, s := range subscribers {
+					s.Dispatch()
+				}
+			}()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var readerWg sync.WaitGroup
+			for _, s := range subscribers {
+				readerWg.Add(1)
+				go func(s Subscriber[int]) {
+					defer readerWg.Done()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case _, ok := <-s.Read():
+							if !ok {
+								return
+							}
+						}
+					}
+				}(s)
+			}
+
+			pub := bc.PublisherCtx(ctx)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				pub <- i
+			}
+
+			b.StopTimer()
+			close(pub)
+			cancel()
+			readerWg.Wait()
+		})
+	}
+}
+
+func BenchmarkBroadcaster_WriteCtx_Parallel(b *testing.B) {
+	for _, subs := range []int{1, 10, 100} {
+		b.Run(subsName(subs), func(b *testing.B) {
+			bc := New[int](16)
+
+			subscribers := make([]Subscriber[int], 0, subs)
+			for i := 0; i < subs; i++ {
+				subscribers = append(subscribers, bc.Subscribe())
+			}
+			defer func() {
+				for _, s := range subscribers {
+					s.Dispatch()
+				}
+			}()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var readerWg sync.WaitGroup
+			for _, s := range subscribers {
+				readerWg.Add(1)
+				go func(s Subscriber[int]) {
+					defer readerWg.Done()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case _, ok := <-s.Read():
+							if !ok {
+								return
+							}
+						}
+					}
+				}(s)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			b.RunParallel(func(pb *testing.PB) {
+				i := 0
+				for pb.Next() {
+					bc.WriteCtx(ctx, i)
+					i++
+				}
+			})
+
+			b.StopTimer()
+			cancel()
+			readerWg.Wait()
+		})
+	}
+}
+
+func BenchmarkBroadcaster_Churn(b *testing.B) {
+	bc := New[int](16)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stable := make([]Subscriber[int], 0, 10)
+	for i := 0; i < 10; i++ {
+		stable = append(stable, bc.Subscribe())
+	}
+	defer func() {
+		for _, s := range stable {
+			s.Dispatch()
+		}
+	}()
+
+	var readerWg sync.WaitGroup
+	for _, s := range stable {
+		readerWg.Add(1)
+		go func(s Subscriber[int]) {
+			defer readerWg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case _, ok := <-s.Read():
+					if !ok {
+						return
+					}
+				}
+			}
+		}(s)
+	}
+
+	var writerWg sync.WaitGroup
+	writerWg.Add(1)
+
+	go func() {
+		defer writerWg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				bc.WriteNonBlock(0)
+			}
+		}
+	}()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		s := bc.Subscribe()
+		s.Dispatch()
+	}
+
+	b.StopTimer()
+	cancel()
+	writerWg.Wait()
+	readerWg.Wait()
+}
+
+func subsName(n int) string {
+	switch n {
+	case 0:
+		return "subs_0"
+	case 1:
+		return "subs_1"
+	case 10:
+		return "subs_10"
+	case 100:
+		return "subs_100"
+	default:
+		return "subs_" + itoa(n)
+	}
+}
+
+func timeoutName(d time.Duration) string {
+	if d == 0 {
+		return "no_timeout"
+	}
+	return "timeout_" + d.String()
+}

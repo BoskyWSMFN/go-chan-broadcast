@@ -1,9 +1,9 @@
 package broadcast
 
 type (
-	// sliceStorage provides thread-safe storage for active channels using copy-on-write
+	// sliceStorage provides thread-safe storage for active channelsManagers using copy-on-write
 	sliceStorage[T any] struct {
-		slice []chan T // TODO linked list?
+		slice []*channelManagement[T]
 	}
 )
 
@@ -17,14 +17,14 @@ func (s *sliceStorage[T]) copySliceTo(newStorage *sliceStorage[T]) {
 	// Ensure slices do not share the same backing array.
 	// If capacity of destination is insufficient, reallocate.
 	if cap(newStorage.slice) < len(s.slice) {
-		newStorage.slice = append(make([]chan T, 0, len(s.slice)), s.slice...)
+		newStorage.slice = append(make([]*channelManagement[T], 0, len(s.slice)), s.slice...)
 	} else {
 		newStorage.slice = newStorage.slice[:copy(newStorage.slice[:cap(newStorage.slice)], s.slice)]
 	}
 }
 
 // appendValue adds a channel to the slice if not already present
-func (s *sliceStorage[T]) appendValue(v chan T) (appended bool) {
+func (s *sliceStorage[T]) appendValue(v *channelManagement[T]) (appended bool) {
 	for _, sliceV := range s.slice {
 		if v == sliceV {
 			return false
@@ -37,7 +37,7 @@ func (s *sliceStorage[T]) appendValue(v chan T) (appended bool) {
 }
 
 // removeValue removes a channel from the slice if present
-func (s *sliceStorage[T]) removeValue(v chan T) (removed bool) {
+func (s *sliceStorage[T]) removeValue(v *channelManagement[T]) (removed bool) {
 	var (
 		valueFound bool
 		valueIndex int
@@ -62,4 +62,10 @@ func (s *sliceStorage[T]) removeValue(v chan T) (removed bool) {
 	s.slice = s.slice[:lastIndex]
 
 	return true
+}
+
+func (s *sliceStorage[T]) clear() {
+	clear(s.slice)
+
+	s.slice = s.slice[:0]
 }
