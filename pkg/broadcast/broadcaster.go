@@ -18,6 +18,15 @@ type (
 	//   - WriteBlock:    blocking, waits indefinitely for all subscribers.
 	//   - WriteCtx:      blocking with cancellation and optional timeout.
 	//   - DetachAndWrite: like WriteCtx, but returns before delivery completes.
+	//
+	// Cloning and releasing:
+	//   - If T implements Cloner[T], each subscriber receives an independent
+	//     clone of the value, produced by calling Clone once per subscriber.
+	//     Otherwise, all subscribers receive the same value.
+	//   - If the cloned value implements Releaser, the caller is responsible
+	//     for releasing it after handling (for example, via Subscriber.Release).
+	//     Values that are not accepted by a subscriber are released by the
+	//     broadcaster automatically.
 	Broadcaster[T any] interface {
 		// WithBlockTimeout returns a copy of the broadcaster with the given
 		// per-write timeout.
@@ -42,6 +51,10 @@ type (
 		// WithBufferSize shares state with the receiver in the same way as
 		// WithBlockTimeout.
 		WithBufferSize(int) Broadcaster[T]
+
+		// Len returns the number of subscribers currently subscribed to this
+		// broadcaster.
+		Len() int
 
 		// Publisher returns a send-only channel that converts channel sends
 		// into broadcasts. Uses context.Background() internally.
@@ -252,6 +265,12 @@ func (b *subscribersManagement[T]) WithBufferSize(bufferSize int) Broadcaster[T]
 	}
 }
 
+// Len returns the number of subscribers currently subscribed to this
+// broadcaster.
+func (b *subscribersManagement[T]) Len() int {
+	return len(b.channelsManagers.Load().slice)
+}
+
 // Publisher returns a send-only channel that converts channel sends into
 // broadcasts. Uses context.Background() internally.
 // For context-aware publishing, use PublisherCtx.
@@ -373,15 +392,29 @@ func (b *subscribersManagement[T]) WriteNonBlock(data T) bool {
 		return false
 	}
 
-	ok := true
+	allSent := true
 
-	for _, channelM := range channelManagers.slice {
-		if !channelM.writeNonBlock(data) {
-			ok = false
+	if cloner, ok := any(data).(Cloner[T]); ok {
+		for _, channelM := range channelManagers.slice {
+			cloned := cloner.Clone()
+
+			if channelM.writeNonBlock(cloned) {
+				continue
+			}
+
+			allSent = false
+
+			tryRelease(cloned)
+		}
+	} else {
+		for _, channelM := range channelManagers.slice {
+			if !channelM.writeNonBlock(data) {
+				allSent = false
+			}
 		}
 	}
 
-	return ok
+	return allSent
 }
 
 // WriteBlock uses blocking send with context.Background().
@@ -492,8 +525,8 @@ func (b *subscribersManagement[T]) removeChannelManagement(chM *channelManagemen
 // ctx. If detach is true, the WaitGroup is returned to the pool from a
 // background goroutine and the caller does not block on delivery.
 func (b *subscribersManagement[T]) write(ctx context.Context, data T, detach bool) {
-	channelManagemers := b.channelsManagers.Load()
-	if len(channelManagemers.slice) == 0 {
+	channelManagers := b.channelsManagers.Load()
+	if len(channelManagers.slice) == 0 {
 		return
 	}
 
@@ -505,15 +538,27 @@ func (b *subscribersManagement[T]) write(ctx context.Context, data T, detach boo
 	if b.blockTimeout > 0 {
 		waitCtx, cancel = context.WithTimeout(ctx, b.blockTimeout)
 	} else {
-		waitCtx, cancel = context.WithCancel(ctx)
+		waitCtx = ctx
+	}
+
+	if len(channelManagers.slice) == 1 {
+		b.writeOnce(waitCtx, cancel, data, detach, channelManagers.slice[0])
+
+		return
 	}
 
 	wg := b.waitGroupsPool.Get().(*sync.WaitGroup)
 
-	wg.Add(len(channelManagemers.slice))
+	wg.Add(len(channelManagers.slice))
 
-	for _, channelM := range channelManagemers.slice {
-		go channelM.write(waitCtx, wg, data)
+	if cloner, ok := any(data).(Cloner[T]); ok {
+		for _, channelM := range channelManagers.slice {
+			b.writeAndRelease(waitCtx, channelM, wg, cloner.Clone())
+		}
+	} else {
+		for _, channelM := range channelManagers.slice {
+			b.writeAndRelease(waitCtx, channelM, wg, data)
+		}
 	}
 
 	if !detach {
@@ -523,9 +568,67 @@ func (b *subscribersManagement[T]) write(ctx context.Context, data T, detach boo
 	}
 }
 
+func (b *subscribersManagement[T]) writeAndRelease(
+	ctx context.Context,
+	channelM *channelManagement[T],
+	wg *sync.WaitGroup,
+	data T,
+) {
+	go func() {
+		if channelM.write(ctx, wg, data) {
+			return
+		}
+
+		tryRelease(data)
+	}()
+}
+
+func (b *subscribersManagement[T]) writeOnce(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	data T,
+	detach bool,
+	destination *channelManagement[T],
+) {
+	if cloner, ok := any(data).(Cloner[T]); ok {
+		data = cloner.Clone()
+	}
+
+	if !detach {
+		if !destination.write(ctx, nil, data) {
+			tryRelease(data)
+		}
+
+		if cancel != nil {
+			cancel()
+		}
+
+		return
+	}
+
+	go func() {
+		if !destination.write(ctx, nil, data) {
+			tryRelease(data)
+		}
+
+		if cancel != nil {
+			cancel()
+		}
+	}()
+}
+
 func waitAndPutWGToPool(cancel context.CancelFunc, wg *sync.WaitGroup, pool *sync.Pool) {
-	defer cancel()
+	if cancel != nil {
+		defer cancel()
+	}
+
 	defer pool.Put(wg)
 
 	wg.Wait()
+}
+
+func tryRelease[T any](v T) {
+	if r, ok := any(v).(Releaser); ok {
+		r.Release()
+	}
 }

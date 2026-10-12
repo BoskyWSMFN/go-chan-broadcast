@@ -303,6 +303,10 @@ type Broadcaster[T any] interface {
 	// the returned broadcaster via Subscribe, and to publisher channels.
 	WithBufferSize(int) Broadcaster[T]
 
+    // Len returns the number of subscribers currently subscribed to this
+    // broadcaster.
+    Len() int
+
 	// Publisher returns a send-only channel for convenient broadcasting.
 	// Uses context.Background(). Close the channel to prevent goroutine leaks.
 	Publisher() chan<- T
@@ -350,17 +354,22 @@ type Subscriber[T any] interface {
 	// Cap returns the buffer capacity of the subscriber's channel.
 	// Diagnostic only.
 	Cap() int
+
+    // Release invokes Release on the given Releaser, returning the value
+    // to its source (for example, a sync.Pool).
+	// Release is a no-op if releaser is nil.
+    Release(Releaser)
 }
 ```
 
 ## Delivery semantics
 
-| Method             | Blocks? | Guaranteed delivery? | Respects ctx? | Respects timeout? |
-|--------------------|---------|----------------------|---------------|-------------------|
-| `WriteNonBlock`    | No      | No                   | No            | No                |
-| `WriteBlock`       | Yes     | Yes                  | No            | Yes               |
-| `WriteCtx`         | Yes     | Yes                  | Yes           | Yes               |
-| `DetachAndWrite`   | No      | Background delivery  | Yes           | Yes               |
+| Method             | Blocks? | Guaranteed? | ctx? | Timeout? | Auto-clone? | Auto-release (rejected)? | Caller must release (delivered)? |
+|--------------------|---------|-------------|------|----------|-------------|--------------------------|----------------------------------|
+| `WriteNonBlock`    | No      | No          | No   | No       | Optional    | Yes                      | Yes (if `Releaser`)              |
+| `WriteBlock`       | Yes     | Yes         | No   | Yes      | Optional    | Yes                      | Yes (if `Releaser`)              |
+| `WriteCtx`         | Yes     | Yes         | Yes  | Yes      | Optional    | Yes                      | Yes (if `Releaser`)              |
+| `DetachAndWrite`   | No      | Background  | Yes  | Yes      | Optional    | Yes                      | Yes (if `Releaser`)              |
 
 Notes:
 - "Guaranteed delivery" means the call waits for every subscriber to accept
@@ -372,14 +381,20 @@ Notes:
 Approximate costs on a modern x86-64 machine (AMD Ryzen 7 6800H, Go 1.27).
 Actual numbers depend on workload, buffer sizes, and scheduler state.
 
-| Operation                                  | Cost       | Allocations |
-|--------------------------------------------|-----------:|------------:|
-| `WriteNonBlock` (0 subscribers)            | ~3.5 ns    | 0           |
-| `WriteNonBlock` (1 subscriber, buf 16)     | ~88 ns     | 0           |
-| `WriteNonBlock` (100 subscribers, buf 16)  | ~57 µs     | 0           |
-| `WriteCtx` (1 subscriber, buf 16)          | ~1.1 µs    | 4           |
-| `WriteCtx` (100 subscribers, buf 16)       | ~83 µs     | 103         |
-| `Subscribe` + `Dispatch`                   | ~400–520 ns| 7–8         |
+| Operation                                  | Cost        | Allocations |
+|--------------------------------------------|------------:|------------:|
+| `WriteNonBlock` (0 subscribers)            | ~2.5 ns     | 0           |
+| `WriteNonBlock` (1 subscriber, buf 16)     | ~71 ns      | 0           |
+| `WriteNonBlock` (10 subscribers, buf 16)   | ~785 ns     | 0           |
+| `WriteNonBlock` (100 subscribers, buf 16)  | ~26 µs      | 0           |
+| `WriteCtx` (0 subscribers)                 | ~2.7 ns     | 0           |
+| `WriteCtx` (1 subscriber, buf 16)          | ~180 ns     | 0           |
+| `WriteCtx` (10 subscribers, buf 16)        | ~6.1 µs     | 10          |
+| `WriteCtx` (100 subscribers, buf 16)       | ~67 µs      | 100         |
+| `WriteCtx` with timeout (1 subscriber)     | ~790 ns     | 5           |
+| `Subscribe` + `Dispatch` (0 subs)          | ~302 ns     | 7           |
+| `Subscribe` + `Dispatch` (1 sub)           | ~355 ns     | 8           |
+| `Subscribe` + `Dispatch` (10 subs)         | ~410 ns     | 8           |
 
 Key observations:
 

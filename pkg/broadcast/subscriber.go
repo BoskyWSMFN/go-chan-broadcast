@@ -9,6 +9,11 @@ import (
 type (
 	// Subscriber allows reading data sent through Broadcaster.
 	// Each subscriber receives its own copy of the data.
+	//
+	// Values are delivered to the channel returned by Read. If the Broadcaster
+	// was configured with a value type that implements Cloner[T], each
+	// subscriber receives an independent clone; otherwise all subscribers
+	// share the same value.
 	Subscriber[T any] interface {
 		// Read returns a channel for reading data.
 		// The channel is closed immediately after Dispatch is called.
@@ -16,6 +21,11 @@ type (
 		// Calling Read after Dispatch returns a closed channel.
 		// Calling Read concurrently with Dispatch is safe, but the
 		// returned channel may be closed at any moment.
+		//
+		// If the delivered values implement Releaser, the caller must invoke
+		// Release once the value is no longer needed, to return it to its
+		// source (e.g. a pool). Values that do not implement Releaser can be
+		// discarded normally; the garbage collector will reclaim them.
 		Read() <-chan T
 
 		// Dispatch unsubscribes the subscriber, closes the channel,
@@ -29,6 +39,9 @@ type (
 		// Dispatch may block until any in-flight WriteCtx/WriteBlock call
 		// targeting this subscriber finishes (or its context is canceled).
 		// With WriteNonBlock, Dispatch does not block.
+		//
+		// Dispatch does not release values already delivered to Read; the
+		// caller remains responsible for calling Release on them if needed.
 		Dispatch()
 
 		// Len returns the number of elements currently buffered in the
@@ -43,6 +56,22 @@ type (
 		// Cap is intended for diagnostics only and must not be used for
 		// synchronization.
 		Cap() int
+
+		// Release invokes Release on the given Releaser, returning the value
+		// to its source (for example, a sync.Pool).
+		//
+		// Release is a convenience wrapper that lets callers release values
+		// without an explicit type assertion:
+		//
+		//	for v := range sub.Read() {
+		//	    handle(v)
+		//	    if r, ok := any(v).(Releaser); ok {
+		//	        sub.Release(r)
+		//	    }
+		//	}
+		//
+		// Release is a no-op if releaser is nil.
+		Release(Releaser)
 	}
 
 	// channelManagement implements Subscriber using atomic operations and
@@ -127,6 +156,9 @@ func newSubscriber[T any](
 
 // Read returns a channel for reading data.
 // Returns a closed channel after Dispatch is called.
+// Read does not block and does not acquire mu; it is safe to call
+// concurrently with Dispatch, but the returned channel may be closed at
+// any moment after Dispatch begins.
 func (s *channelManagement[T]) Read() <-chan T {
 	return s.getChannelFromAtomicValue()
 }
@@ -139,6 +171,26 @@ func (s *channelManagement[T]) Len() int {
 // Cap returns the buffer capacity of the current channel.
 func (s *channelManagement[T]) Cap() int {
 	return int(s.chBuffer.Load())
+}
+
+// Release invokes Release on the given Releaser, returning the value
+// to its source (for example, a sync.Pool).
+//
+// Release is a convenience wrapper that lets callers release values
+// without an explicit type assertion:
+//
+//	for v := range sub.Read() {
+//	    handle(v)
+//	    if r, ok := any(v).(Releaser); ok {
+//	        sub.Release(r)
+//	    }
+//	}
+//
+// Release is a no-op if releaser is nil.
+func (s *channelManagement[T]) Release(releaser Releaser) {
+	if releaser != nil {
+		releaser.Release()
+	}
 }
 
 // getChannelFromAtomicValue safely retrieves the current data channel.
@@ -227,31 +279,45 @@ func (s *channelManagement[T]) done() <-chan struct{} {
 // it acquires mu.Lock, so a writer blocked in select is guaranteed to be
 // woken up even if Dispatch is waiting for mu.Lock.
 //
+// Returns true if the value was accepted by the channel and false
+// otherwise.
+//
 // write always calls wg.Done before returning, even if the send is skipped
 // because the subscriber has already been dispatched or the context is done.
-func (s *channelManagement[T]) write(ctx context.Context, wg *sync.WaitGroup, data T) {
-	defer wg.Done()
+//
+// *sync.WaitGroup may be nil, in which case no [sync.WaitGroup.Done] is called.
+func (s *channelManagement[T]) write(ctx context.Context, wg *sync.WaitGroup, data T) bool {
+	if wg != nil {
+		defer wg.Done()
+	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	if s.isDone() {
-		return
+		return false
 	}
 
 	select {
 	case s.getChannelFromAtomicValue() <- data:
+		return true
 	case <-s.done():
+		return false
 	case <-ctx.Done():
+		return false
 	}
 }
 
 // writeNonBlock performs a non-blocking send of data to the subscriber's
 // channel.
 //
-// Returns true if the value was accepted by the channel, false if the
-// subscriber has been dispatched, the buffer is full, or the send would
-// have blocked.
+// writeNonBlock holds mu.RLock for the duration of the select, which prevents
+// Dispatch from closing ch underneath it. done is closed by Dispatch before
+// it acquires mu.Lock, so a writer blocked in select is guaranteed to be
+// woken up even if Dispatch is waiting for mu.Lock.
+//
+// Returns true if the value was accepted by the channel and false
+// otherwise.
 //
 // Like write, writeNonBlock holds mu.RLock for the duration of the select.
 func (s *channelManagement[T]) writeNonBlock(data T) bool {
